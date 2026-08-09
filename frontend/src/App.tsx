@@ -1,0 +1,608 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  ActivityIndicator,
+  Alert,
+  Animated,
+  Easing,
+  Platform,
+  Pressable,
+  ScrollView,
+  StyleSheet,
+  Switch,
+  Text,
+  View,
+  useColorScheme,
+  useWindowDimensions,
+} from "react-native";
+import { StatusBar } from "expo-status-bar";
+import { LinearGradient } from "expo-linear-gradient";
+import * as DocumentPicker from "expo-document-picker";
+import {
+  AudioModule,
+  RecordingPresets,
+  setAudioModeAsync,
+  useAudioPlayer,
+  useAudioPlayerStatus,
+  useAudioRecorder,
+  useAudioRecorderState,
+  useAudioStream,
+} from "expo-audio";
+import { Feather, Ionicons, MaterialCommunityIcons } from "@expo/vector-icons";
+import {
+  DMSans_400Regular,
+  DMSans_500Medium,
+  DMSans_600SemiBold,
+  DMSans_700Bold,
+  useFonts,
+} from "@expo-google-fonts/dm-sans";
+
+import { getAudioUrl, getHistory, getTranscript, submitAudio, WS_URL } from "./api";
+import type { Language, Segment, SessionType, TranscriptRecord } from "./types";
+import { startWebAudioStream, type WebAudioStream } from "./webAudioStream";
+
+const LANGUAGES: Array<{ value: Language; native: string }> = [
+  { value: "Sinhala", native: "සිංහල" },
+  { value: "Tamil", native: "தமிழ்" },
+  { value: "English", native: "English" },
+  { value: "Mixed", native: "Mixed" },
+];
+
+const SESSION_TYPES: Array<{
+  value: SessionType;
+  label: string;
+  hint: string;
+  icon: keyof typeof Feather.glyphMap;
+}> = [
+  { value: "Record", label: "Record", hint: "Capture a session", icon: "mic" },
+  { value: "Live", label: "Live", hint: "Transcribe as you speak", icon: "radio" },
+  { value: "Upload", label: "Upload", hint: "Choose an audio file", icon: "upload-cloud" },
+];
+
+const waveform = [18, 30, 45, 25, 58, 38, 68, 48, 26, 54, 73, 42, 62, 30, 50, 22, 38, 66, 44, 28, 56, 35, 18];
+
+function formatTime(seconds: number) {
+  const minutes = Math.floor(seconds / 60).toString().padStart(2, "0");
+  const rest = Math.floor(seconds % 60).toString().padStart(2, "0");
+  return `${minutes}:${rest}`;
+}
+
+function speakerColor(speaker?: string | null) {
+  if (!speaker) return "#B9B7C6";
+  const numericLabel = speaker.match(/\d+/)?.[0];
+  const number = numericLabel
+    ? Number(numericLabel)
+    : [...speaker].reduce((hash, character) => hash + character.charCodeAt(0), 0);
+  return ["#A78BFA", "#34D399", "#60A5FA", "#FB7185"][number % 4] ?? "#A78BFA";
+}
+
+type AppStyles = ReturnType<typeof createStyles>;
+
+function SectionTitle({ number, title, styles }: { number: string; title: string; styles: AppStyles }) {
+  return (
+    <View style={styles.sectionTitle}>
+      <View style={styles.numberBadge}><Text style={styles.numberText}>{number}</Text></View>
+      <Text style={styles.sectionHeading}>{title}</Text>
+    </View>
+  );
+}
+
+function AnimatedWaveform({ active, intensity, styles }: { active: boolean; intensity: number; styles: AppStyles }) {
+  const levels = useRef(waveform.map(() => new Animated.Value(0))).current;
+
+  useEffect(() => {
+    const target = active ? Math.max(0.03, Math.min(1, intensity)) : 0;
+    const animation = Animated.parallel(levels.map((level, index) =>
+      Animated.timing(level, {
+        toValue: Math.min(1, target * (0.65 + (waveform[index]! / 73) * 0.55)),
+        duration: 90,
+        easing: Easing.out(Easing.quad),
+        useNativeDriver: false,
+      }),
+    ));
+    animation.start();
+    return () => animation.stop();
+  }, [active, intensity, levels]);
+
+  return (
+    <View style={styles.waveform} accessibilityLabel={active ? "Audio waveform active" : "Audio waveform idle"}>
+      {waveform.map((height, index) => (
+        <Animated.View
+          key={index}
+          style={[
+            styles.waveBar,
+            {
+              height: levels[index]!.interpolate({ inputRange: [0, 1], outputRange: [5, height] }),
+              opacity: levels[index]!.interpolate({ inputRange: [0, 1], outputRange: [0.22, 0.95] }),
+            },
+          ]}
+        />
+      ))}
+    </View>
+  );
+}
+
+function AudioPlayback({ recordId, styles }: { recordId: string; styles: AppStyles }) {
+  const player = useAudioPlayer(getAudioUrl(recordId), { updateInterval: 250 });
+  const playback = useAudioPlayerStatus(player);
+  const total = playback.duration || 0;
+
+  const toggle = async () => {
+    if (playback.playing) {
+      player.pause();
+      return;
+    }
+    await setAudioModeAsync({ allowsRecording: false, playsInSilentMode: true });
+    if (playback.didJustFinish || (total > 0 && playback.currentTime >= total - 0.1)) {
+      await player.seekTo(0);
+    }
+    player.play();
+  };
+
+  return (
+    <View style={styles.audioPlayer}>
+      <Pressable accessibilityRole="button" accessibilityLabel={playback.playing ? "Pause recording" : "Play recording"} onPress={() => void toggle()} style={styles.audioPlayButton}>
+        <Feather name={playback.playing ? "pause" : "play"} size={15} color="white" />
+      </Pressable>
+      <View style={styles.audioProgressTrack}>
+        <View style={[styles.audioProgressFill, { width: `${total > 0 ? Math.min(100, (playback.currentTime / total) * 100) : 0}%` }]} />
+      </View>
+      <Text style={styles.audioTime}>{formatTime(playback.currentTime)} / {formatTime(total)}</Text>
+    </View>
+  );
+}
+
+function TranscriptPanel({
+  segments,
+  active,
+  status,
+  duration,
+  intensity = 0,
+  audioRecordId,
+  styles,
+}: {
+  segments: Segment[];
+  active: boolean;
+  status: string;
+  duration: number;
+  intensity?: number;
+  audioRecordId?: string | null;
+  styles: AppStyles;
+}) {
+  return (
+    <View style={styles.transcriptCard}>
+      <View style={styles.transcriptHeader}>
+        <View>
+          <Text style={styles.panelEyebrow}>TRANSCRIPT</Text>
+          <Text style={styles.panelTitle}>{active ? "Listening now" : "Your words appear here"}</Text>
+        </View>
+        <View style={[styles.liveBadge, !active && styles.idleBadge]}>
+          <View style={[styles.liveDot, !active && styles.idleDot]} />
+          <Text style={[styles.liveText, !active && styles.idleText]}>{active ? "LIVE" : status.toUpperCase()}</Text>
+        </View>
+      </View>
+
+      <AnimatedWaveform active={active} intensity={intensity} styles={styles} />
+      <View style={styles.timelineRow}>
+        <Text style={styles.timeText}>{formatTime(duration)}</Text>
+        <View style={styles.timeline} />
+        <Text style={styles.timeText}>{active ? "REC" : "READY"}</Text>
+      </View>
+
+      {audioRecordId && !active && status === "completed" ? <AudioPlayback recordId={audioRecordId} styles={styles} /> : null}
+
+      <ScrollView style={styles.transcriptScroll} contentContainerStyle={styles.transcriptContent}>
+        {segments.length === 0 ? (
+          <View style={styles.emptyTranscript}>
+            <View style={styles.emptyIcon}><MaterialCommunityIcons name="waveform" size={26} color="#8F8A9E" /></View>
+            <Text style={styles.emptyTitle}>Ready when you are</Text>
+            <Text style={styles.emptyCopy}>Choose your language and session type, then start transcribing.</Text>
+          </View>
+        ) : segments.map((segment, index) => (
+          <View key={`${segment.start}-${index}`} style={styles.segmentRow}>
+            <Text style={styles.segmentTime}>{formatTime(segment.start)}</Text>
+            <View style={[styles.speakerLine, { backgroundColor: speakerColor(segment.speaker) }]} />
+            <View style={styles.segmentBody}>
+              {segment.speaker || segment.detected_language ? (
+                <View style={styles.segmentMeta}>
+                  {segment.speaker ? <Text style={[styles.speakerName, { color: speakerColor(segment.speaker) }]}>{segment.speaker}</Text> : null}
+                  {segment.detected_language ? <Text style={styles.languageTag}>{segment.detected_language}</Text> : null}
+                </View>
+              ) : null}
+              <Text style={styles.segmentText}>{segment.text}</Text>
+            </View>
+          </View>
+        ))}
+      </ScrollView>
+    </View>
+  );
+}
+
+export default function App() {
+  const [fontsLoaded] = useFonts({
+    DMSans_400Regular,
+    DMSans_500Medium,
+    DMSans_600SemiBold,
+    DMSans_700Bold,
+  });
+  const { width } = useWindowDimensions();
+  const systemScheme = useColorScheme();
+  const [isDark, setIsDark] = useState(systemScheme !== "light");
+  const styles = useMemo(() => createStyles(isDark), [isDark]);
+  const isWide = width >= 900;
+  const [tab, setTab] = useState<"new" | "history">("new");
+  const [language, setLanguage] = useState<Language>("Sinhala");
+  const [sessionType, setSessionType] = useState<SessionType>("Live");
+  const [diarization, setDiarization] = useState(true);
+  const [active, setActive] = useState(false);
+  const [status, setStatus] = useState("ready");
+  const [duration, setDuration] = useState(0);
+  const [voiceIntensity, setVoiceIntensity] = useState(0);
+  const [segments, setSegments] = useState<Segment[]>([]);
+  const [history, setHistory] = useState<TranscriptRecord[]>([]);
+  const [selected, setSelected] = useState<TranscriptRecord | null>(null);
+  const [jobId, setJobId] = useState<string | null>(null);
+  const [currentRecordId, setCurrentRecordId] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const socketRef = useRef<WebSocket | null>(null);
+  const webAudioRef = useRef<WebAudioStream | null>(null);
+  const recorder = useAudioRecorder({ ...RecordingPresets.HIGH_QUALITY, isMeteringEnabled: true });
+  const recorderState = useAudioRecorderState(recorder, 250);
+
+  const onAudioBuffer = useCallback((buffer: { data: ArrayBuffer }) => {
+    const socket = socketRef.current;
+    if (socket?.readyState === WebSocket.OPEN) socket.send(buffer.data);
+    const samples = new Int16Array(buffer.data);
+    let sumSquares = 0;
+    for (let index = 0; index < samples.length; index += 1) {
+      const sample = samples[index]! / 32768;
+      sumSquares += sample * sample;
+    }
+    const rms = Math.sqrt(sumSquares / Math.max(1, samples.length));
+    setVoiceIntensity((current) => current * 0.35 + Math.min(1, rms * 5) * 0.65);
+  }, []);
+  const liveAudio = useAudioStream({ sampleRate: 16000, channels: 1, encoding: "int16", onBuffer: onAudioBuffer });
+
+  const stopAudioCapture = useCallback(async () => {
+    if (Platform.OS === "web") {
+      const capture = webAudioRef.current;
+      webAudioRef.current = null;
+      await capture?.stop();
+      return;
+    }
+    liveAudio.stream?.stop();
+  }, [liveAudio.stream]);
+
+  useEffect(() => () => {
+    socketRef.current?.close();
+    void stopAudioCapture();
+  }, [stopAudioCapture]);
+
+  useEffect(() => {
+    if (!active) return;
+    const started = Date.now() - duration * 1000;
+    const timer = setInterval(() => setDuration((Date.now() - started) / 1000), 250);
+    return () => clearInterval(timer);
+  }, [active]);
+
+  useEffect(() => {
+    if (sessionType !== "Record" || !active) return;
+    const decibels = recorderState.metering ?? -60;
+    setVoiceIntensity(Math.max(0, Math.min(1, (decibels + 60) / 50)));
+  }, [active, recorderState.metering, sessionType]);
+
+  const refreshHistory = useCallback(async () => {
+    try { setHistory(await getHistory()); } catch { /* backend may not be running yet */ }
+  }, []);
+
+  useEffect(() => { void refreshHistory(); }, [refreshHistory]);
+
+  useEffect(() => {
+    if (!jobId) return;
+    const timer = setInterval(async () => {
+      try {
+        const record = await getTranscript(jobId);
+        setStatus(record.status);
+        setDuration((current) => record.duration_seconds ?? current);
+        if (record.segments.length) setSegments(record.segments);
+        if (record.status === "completed" || record.status === "failed") {
+          setJobId(null);
+          setBusy(false);
+          await refreshHistory();
+          if (record.status === "failed") Alert.alert("Transcription failed", record.error ?? "Unknown error");
+        }
+      } catch { /* retry on the next tick */ }
+    }, 1500);
+    return () => clearInterval(timer);
+  }, [jobId, refreshHistory]);
+
+  const prepareMic = async () => {
+    if (Platform.OS === "web") return;
+    const permission = await AudioModule.requestRecordingPermissionsAsync();
+    if (!permission.granted) throw new Error("Microphone permission is required");
+    await setAudioModeAsync({ allowsRecording: true, playsInSilentMode: true });
+  };
+
+  const startLive = async () => {
+    await prepareMic();
+    setSegments([]);
+    setDuration(0);
+    setVoiceIntensity(0);
+    setStatus("connecting");
+    setBusy(true);
+    if (Platform.OS === "web") {
+      webAudioRef.current = await startWebAudioStream((buffer, level) => {
+        setVoiceIntensity((current) => current * 0.35 + level * 0.65);
+        onAudioBuffer({ data: buffer });
+      });
+    }
+    const socket = new WebSocket(WS_URL);
+    socket.binaryType = "arraybuffer";
+    socketRef.current = socket;
+    socket.onopen = () => {
+      socket.send(JSON.stringify({ language, diarization, sample_rate: 16000, title: `Live • ${new Date().toLocaleString()}` }));
+    };
+    socket.onmessage = (event) => {
+      void (async () => {
+        try {
+          const message = JSON.parse(String(event.data));
+          if (message.type === "ready") {
+            setJobId(message.id);
+            setCurrentRecordId(message.id);
+            if (Platform.OS !== "web") await liveAudio.stream.start();
+            setStatus("listening");
+            setActive(true);
+            setBusy(false);
+          } else if (message.type === "transcript") {
+            setSegments((current) => [...current, message.segment]);
+          } else if (message.type === "finalizing") {
+            setJobId(message.id);
+            setStatus("processing");
+          } else if (message.type === "error") {
+            await stopAudioCapture();
+            setActive(false);
+            setBusy(false);
+            Alert.alert("Live transcription", message.message);
+          }
+        } catch (error) {
+          await stopAudioCapture();
+          socket.close();
+          setActive(false);
+          setBusy(false);
+          setStatus("error");
+          Alert.alert("Live transcription", error instanceof Error ? error.message : "Could not start audio capture");
+        }
+      })();
+    };
+    socket.onerror = () => {
+      void stopAudioCapture();
+      setActive(false);
+      setBusy(false);
+      setStatus("offline");
+      Alert.alert("Connection failed", `Could not connect to ${WS_URL}`);
+    };
+    socket.onclose = () => {
+      if (socketRef.current === socket) socketRef.current = null;
+      void stopAudioCapture();
+      setActive(false);
+    };
+  };
+
+  const stopLive = async () => {
+    await stopAudioCapture();
+    socketRef.current?.send("stop");
+    setActive(false);
+    setBusy(true);
+    setStatus(diarization ? "finalizing speakers" : "saving");
+  };
+
+  const startRecord = async () => {
+    await prepareMic();
+    setSegments([]);
+    setDuration(0);
+    await recorder.prepareToRecordAsync();
+    recorder.record();
+    setStatus("recording");
+    setActive(true);
+  };
+
+  const stopRecord = async () => {
+    const recordedDuration = recorderState.durationMillis / 1000;
+    await recorder.stop();
+    setActive(false);
+    const uri = recorder.uri;
+    if (!uri) throw new Error("The recording could not be saved");
+    setBusy(true);
+    setStatus("uploading");
+    const result = await submitAudio(uri, "recording.m4a", "audio/mp4", language, "Record", diarization, undefined, recordedDuration);
+    setJobId(result.id);
+    setCurrentRecordId(result.id);
+    setStatus("queued");
+  };
+
+  const chooseUpload = async () => {
+    const result = await DocumentPicker.getDocumentAsync({ type: "audio/*", copyToCacheDirectory: true });
+    if (result.canceled) return;
+    const asset = result.assets[0];
+    if (!asset) return;
+    setBusy(true);
+    setSegments([]);
+    setStatus("uploading");
+    try {
+      const job = await submitAudio(asset.uri, asset.name, asset.mimeType ?? "audio/mpeg", language, "Upload", diarization, asset.file);
+      setJobId(job.id);
+      setCurrentRecordId(job.id);
+      setStatus("queued");
+    } catch (error) {
+      setBusy(false);
+      Alert.alert("Upload failed", error instanceof Error ? error.message : "Unknown error");
+    }
+  };
+
+  const handlePrimary = async () => {
+    try {
+      if (active) return sessionType === "Live" ? await stopLive() : await stopRecord();
+      if (sessionType === "Upload") return await chooseUpload();
+      if (sessionType === "Live") return await startLive();
+      return await startRecord();
+    } catch (error) {
+      if (sessionType === "Live") {
+        await stopAudioCapture();
+        socketRef.current?.close();
+        socketRef.current = null;
+      }
+      setActive(false);
+      setBusy(false);
+      Alert.alert("Could not start", error instanceof Error ? error.message : "Unknown error");
+    }
+  };
+
+  const primaryLabel = active ? "Stop session" : sessionType === "Upload" ? "Choose audio file" : sessionType === "Live" ? "Start live transcription" : "Start recording";
+  const shownDuration = sessionType === "Record" && active ? recorderState.durationMillis / 1000 : duration;
+  const displayedSegments = selected?.segments ?? segments;
+
+  if (!fontsLoaded) return <View style={styles.loading}><ActivityIndicator color="#9F7AEA" /></View>;
+
+  return (
+    <View style={styles.app}>
+      <StatusBar style={isDark ? "light" : "dark"} />
+      <View style={styles.glowOne} /><View style={styles.glowTwo} />
+      <View style={styles.header}>
+        <Pressable style={styles.brand} onPress={() => { setTab("new"); setSelected(null); }}>
+          <LinearGradient colors={["#A78BFA", "#6D5CE7"]} style={styles.logo}>
+            <MaterialCommunityIcons name="waveform" size={23} color="white" />
+          </LinearGradient>
+          <View><Text style={styles.brandName}>HelaScribe</Text><Text style={styles.brandTagline}>VOICE TO TEXT, BEAUTIFULLY</Text></View>
+        </Pressable>
+        {isWide ? (
+          <View style={styles.desktopNav}>
+            <Pressable onPress={() => { setTab("new"); setSelected(null); }} style={[styles.navItem, tab === "new" && styles.navItemActive]}><Feather name="plus-circle" size={17} color={tab === "new" ? "#C4B5FD" : "#8F8A9E"} /><Text style={[styles.navText, tab === "new" && styles.navTextActive]}>New transcript</Text></Pressable>
+            <Pressable onPress={() => { setTab("history"); void refreshHistory(); }} style={[styles.navItem, tab === "history" && styles.navItemActive]}><Feather name="clock" size={17} color={tab === "history" ? "#C4B5FD" : "#8F8A9E"} /><Text style={[styles.navText, tab === "history" && styles.navTextActive]}>History</Text></Pressable>
+          </View>
+        ) : null}
+        <View style={styles.headerActions}>
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel={`Switch to ${isDark ? "light" : "dark"} mode`}
+            onPress={() => setIsDark((current) => !current)}
+            style={({ pressed }) => [styles.themeButton, pressed && { opacity: 0.7 }]}
+          >
+            <Feather name={isDark ? "sun" : "moon"} size={17} color={isDark ? "#D8CDF8" : "#5C477A"} />
+          </Pressable>
+          <View style={styles.avatar}><Text style={styles.avatarText}>KS</Text></View>
+        </View>
+      </View>
+
+      {tab === "history" ? (
+        <ScrollView contentContainerStyle={styles.historyPage}>
+          <View style={styles.pageIntro}><Text style={styles.eyebrow}>YOUR LIBRARY</Text><Text style={styles.heroTitle}>Transcript history</Text><Text style={styles.heroCopy}>Every conversation, ready when you need it.</Text></View>
+          <View style={[styles.historyLayout, isWide && styles.historyLayoutWide]}>
+            <View style={styles.historyList}>
+              {history.length === 0 ? <Text style={styles.emptyCopy}>No transcripts yet. Start your first session.</Text> : history.map((item) => (
+                <Pressable key={item.id} onPress={() => setSelected(item)} style={[styles.historyItem, selected?.id === item.id && styles.historyItemSelected]}>
+                  <View style={styles.historyIcon}><Feather name={item.session_type === "Live" ? "radio" : item.session_type === "Upload" ? "upload-cloud" : "mic"} size={19} color="#B9A7FF" /></View>
+                  <View style={styles.historyBody}><Text numberOfLines={1} style={styles.historyTitle}>{item.title}</Text><Text style={styles.historyMeta}>{item.language} · {new Date(item.created_at).toLocaleDateString()} · {item.status}</Text></View>
+                  <Feather name="chevron-right" size={18} color="#625E70" />
+                </Pressable>
+              ))}
+            </View>
+            <TranscriptPanel segments={displayedSegments} active={false} status={selected?.status ?? "select one"} duration={selected?.duration_seconds ?? 0} audioRecordId={selected?.audio_filename ? selected.id : null} styles={styles} />
+          </View>
+        </ScrollView>
+      ) : (
+        <ScrollView contentContainerStyle={styles.mainScroll} keyboardShouldPersistTaps="handled">
+          <View style={styles.pageIntro}>
+            <Text style={styles.eyebrow}>NEW TRANSCRIPTION</Text>
+            <Text style={styles.heroTitle}>Turn every voice into words.</Text>
+            <Text style={styles.heroCopy}>Fast, accurate transcription for Sinhala, Tamil and English.</Text>
+          </View>
+          <View style={[styles.workspace, isWide && styles.workspaceWide]}>
+            <View style={styles.controlsColumn}>
+              <View style={styles.controlSection}>
+                <SectionTitle number="01" title="Choose your language" styles={styles} />
+                <View style={styles.languageGrid}>
+                  {LANGUAGES.map((item) => (
+                    <Pressable key={item.value} disabled={active || busy} onPress={() => setLanguage(item.value)} style={[styles.languagePill, language === item.value && styles.languagePillActive]}>
+                      <Text style={[styles.languageNative, language === item.value && styles.languageNativeActive]}>{item.native}</Text>
+                      {item.value !== item.native ? <Text style={styles.languageEnglish}>{item.value}</Text> : null}
+                      {language === item.value ? <View style={styles.checkDot}><Feather name="check" size={10} color="#17131F" /></View> : null}
+                    </Pressable>
+                  ))}
+                </View>
+              </View>
+
+              <View style={styles.controlSection}>
+                <SectionTitle number="02" title="How would you like to begin?" styles={styles} />
+                <View style={[styles.sessionGrid, !isWide && width < 540 && styles.sessionGridStack]}>
+                  {SESSION_TYPES.map((item) => (
+                    <Pressable key={item.value} disabled={active || busy} onPress={() => setSessionType(item.value)} style={[styles.sessionCard, sessionType === item.value && styles.sessionCardActive]}>
+                      <View style={[styles.sessionIcon, sessionType === item.value && styles.sessionIconActive]}><Feather name={item.icon} size={20} color={sessionType === item.value ? "white" : "#9A95A8"} /></View>
+                      <Text style={[styles.sessionLabel, sessionType === item.value && styles.sessionLabelActive]}>{item.label}</Text>
+                      <Text style={styles.sessionHint}>{item.hint}</Text>
+                    </Pressable>
+                  ))}
+                </View>
+              </View>
+
+              <View style={styles.toggleCard}>
+                <View style={styles.toggleIcon}><MaterialCommunityIcons name="account-voice" size={22} color="#B9A7FF" /></View>
+                <View style={styles.toggleText}><Text style={styles.toggleTitle}>Identify speakers</Text><Text style={styles.toggleHint}>Separate and label each voice automatically</Text></View>
+                <Switch disabled={active || busy} value={diarization} onValueChange={setDiarization} trackColor={{ false: "#393543", true: "#7C62D8" }} thumbColor="#F7F4FF" />
+              </View>
+
+              <Pressable disabled={busy && !active} onPress={() => void handlePrimary()} style={({ pressed }) => [styles.primaryWrap, pressed && { opacity: 0.88 }, busy && !active && { opacity: 0.62 }]}>
+                <LinearGradient colors={active ? ["#EF5C75", "#C93F65"] : ["#A98AF7", "#7258D9"]} start={{ x: 0, y: 0 }} end={{ x: 1, y: 1 }} style={styles.primaryButton}>
+                  {busy && !active ? <ActivityIndicator color="white" size="small" /> : <Feather name={active ? "square" : sessionType === "Upload" ? "upload-cloud" : "mic"} size={19} color="white" />}
+                  <Text style={styles.primaryText}>{busy && !active ? status : active ? `${primaryLabel} · ${formatTime(shownDuration)}` : primaryLabel}</Text>
+                </LinearGradient>
+              </Pressable>
+              <View style={styles.privacyRow}><Feather name="shield" size={13} color="#716C7F" /><Text style={styles.privacyText}>Your audio is encrypted in transit and never used to train public models.</Text></View>
+            </View>
+
+            <TranscriptPanel segments={segments} active={active} status={status} duration={shownDuration} intensity={voiceIntensity} audioRecordId={currentRecordId} styles={styles} />
+          </View>
+        </ScrollView>
+      )}
+
+      {!isWide ? (
+        <View style={styles.mobileNav}>
+          <Pressable onPress={() => { setTab("new"); setSelected(null); }} style={styles.mobileNavItem}><Ionicons name={tab === "new" ? "add-circle" : "add-circle-outline"} size={24} color={tab === "new" ? "#B9A7FF" : "#777181"} /><Text style={[styles.mobileNavText, tab === "new" && styles.mobileNavTextActive]}>New</Text></Pressable>
+          <Pressable onPress={() => { setTab("history"); void refreshHistory(); }} style={styles.mobileNavItem}><Ionicons name={tab === "history" ? "time" : "time-outline"} size={24} color={tab === "history" ? "#B9A7FF" : "#777181"} /><Text style={[styles.mobileNavText, tab === "history" && styles.mobileNavTextActive]}>History</Text></Pressable>
+        </View>
+      ) : null}
+    </View>
+  );
+}
+
+function createStyles(isDark: boolean) {
+  const c = isDark ? {
+    bg: "#100E14", header: "rgba(16,14,20,0.92)", surface: "#1A181E", panel: "#18161C",
+    raised: "#25222B", selected: "#2A2338", border: "#302C38", strongBorder: "#4B4262",
+    text: "#F5F2FA", softText: "#D8D4DF", body: "#C2BEC9", muted: "#8F8A9E", faint: "#716C7B",
+    purpleText: "#D8CDF8", purpleSurface: "#282231", glowOne: "rgba(100,70,170,0.10)", glowTwo: "rgba(83,53,130,0.08)",
+  } : {
+    bg: "#F7F4FB", header: "rgba(255,255,255,0.94)", surface: "#FFFFFF", panel: "#FFFFFF",
+    raised: "#EEE9F4", selected: "#EAE2F7", border: "#DDD6E6", strongBorder: "#C4B5D8",
+    text: "#241D2D", softText: "#42394D", body: "#5E5668", muted: "#766E80", faint: "#91899A",
+    purpleText: "#62499A", purpleSurface: "#EEE7F8", glowOne: "rgba(132,94,210,0.12)", glowTwo: "rgba(160,122,220,0.09)",
+  };
+
+  return StyleSheet.create({
+    app: { flex: 1, backgroundColor: c.bg, overflow: "hidden" }, loading: { flex: 1, backgroundColor: c.bg, alignItems: "center", justifyContent: "center" },
+    glowOne: { position: "absolute", width: 450, height: 450, borderRadius: 225, backgroundColor: c.glowOne, top: -260, left: -160 },
+    glowTwo: { position: "absolute", width: 500, height: 500, borderRadius: 250, backgroundColor: c.glowTwo, bottom: -350, right: -200 },
+    header: { height: Platform.OS === "web" ? 82 : 96, paddingTop: Platform.OS === "web" ? 0 : 22, paddingHorizontal: 28, flexDirection: "row", alignItems: "center", borderBottomWidth: 1, borderBottomColor: c.border, backgroundColor: c.header, zIndex: 4 },
+    brand: { flexDirection: "row", alignItems: "center", gap: 11 }, logo: { width: 42, height: 42, borderRadius: 13, alignItems: "center", justifyContent: "center" }, brandName: { color: c.text, fontFamily: "DMSans_700Bold", fontSize: 19, letterSpacing: -0.4 }, brandTagline: { color: c.faint, fontFamily: "DMSans_600SemiBold", fontSize: 7.5, letterSpacing: 1.25, marginTop: 2 },
+    desktopNav: { marginLeft: "auto", flexDirection: "row", gap: 8, marginRight: 18 }, navItem: { flexDirection: "row", alignItems: "center", gap: 8, paddingHorizontal: 15, height: 40, borderRadius: 10 }, navItemActive: { backgroundColor: c.raised }, navText: { color: c.muted, fontFamily: "DMSans_500Medium", fontSize: 13 }, navTextActive: { color: c.purpleText }, headerActions: { marginLeft: "auto", flexDirection: "row", alignItems: "center", gap: 10 }, themeButton: { width: 36, height: 36, borderRadius: 11, backgroundColor: c.raised, borderWidth: 1, borderColor: c.border, alignItems: "center", justifyContent: "center" }, avatar: { width: 36, height: 36, borderRadius: 18, backgroundColor: c.purpleSurface, borderWidth: 1, borderColor: c.strongBorder, alignItems: "center", justifyContent: "center" }, avatarText: { color: c.purpleText, fontFamily: "DMSans_700Bold", fontSize: 11 },
+    mainScroll: { paddingHorizontal: 22, paddingTop: 48, paddingBottom: 110 }, pageIntro: { width: "100%", maxWidth: 1180, alignSelf: "center", marginBottom: 34 }, eyebrow: { color: "#8063D1", fontFamily: "DMSans_700Bold", fontSize: 10, letterSpacing: 2.3, marginBottom: 10 }, heroTitle: { color: c.text, fontFamily: "DMSans_700Bold", fontSize: 34, letterSpacing: -1.25 }, heroCopy: { color: c.muted, fontFamily: "DMSans_400Regular", fontSize: 14, marginTop: 9 },
+    workspace: { width: "100%", maxWidth: 1180, alignSelf: "center", gap: 22 }, workspaceWide: { flexDirection: "row", alignItems: "stretch" }, controlsColumn: { flex: 1.06, gap: 24 }, controlSection: { gap: 15 }, sectionTitle: { flexDirection: "row", alignItems: "center", gap: 10 }, numberBadge: { width: 27, height: 27, borderRadius: 8, backgroundColor: c.purpleSurface, alignItems: "center", justifyContent: "center" }, numberText: { color: "#8D6BE5", fontFamily: "DMSans_700Bold", fontSize: 10 }, sectionHeading: { color: c.softText, fontFamily: "DMSans_600SemiBold", fontSize: 14 },
+    languageGrid: { flexDirection: "row", flexWrap: "wrap", gap: 9 }, languagePill: { minWidth: 105, height: 58, paddingHorizontal: 16, borderRadius: 13, borderWidth: 1, borderColor: c.border, backgroundColor: c.surface, justifyContent: "center" }, languagePillActive: { borderColor: "#8B70DC", backgroundColor: c.selected }, languageNative: { color: c.body, fontFamily: "DMSans_600SemiBold", fontSize: 13 }, languageNativeActive: { color: c.purpleText }, languageEnglish: { color: c.faint, fontFamily: "DMSans_400Regular", fontSize: 9, marginTop: 2 }, checkDot: { position: "absolute", top: 7, right: 7, width: 16, height: 16, borderRadius: 8, backgroundColor: "#B9A7FF", alignItems: "center", justifyContent: "center" },
+    sessionGrid: { flexDirection: "row", gap: 10 }, sessionGridStack: { flexDirection: "column" }, sessionCard: { flex: 1, minHeight: 118, padding: 14, borderRadius: 15, borderWidth: 1, borderColor: c.border, backgroundColor: c.surface }, sessionCardActive: { borderColor: "#8067CE", backgroundColor: c.selected }, sessionIcon: { width: 36, height: 36, borderRadius: 10, backgroundColor: c.raised, alignItems: "center", justifyContent: "center", marginBottom: 10 }, sessionIconActive: { backgroundColor: "#755BD0" }, sessionLabel: { color: c.body, fontFamily: "DMSans_600SemiBold", fontSize: 13 }, sessionLabelActive: { color: c.purpleText }, sessionHint: { color: c.faint, fontFamily: "DMSans_400Regular", fontSize: 9.5, marginTop: 3 },
+    toggleCard: { minHeight: 74, padding: 14, borderRadius: 15, borderWidth: 1, borderColor: c.border, backgroundColor: c.surface, flexDirection: "row", alignItems: "center" }, toggleIcon: { width: 40, height: 40, borderRadius: 12, backgroundColor: c.purpleSurface, alignItems: "center", justifyContent: "center", marginRight: 12 }, toggleText: { flex: 1 }, toggleTitle: { color: c.softText, fontFamily: "DMSans_600SemiBold", fontSize: 13 }, toggleHint: { color: c.faint, fontFamily: "DMSans_400Regular", fontSize: 10, marginTop: 3 },
+    primaryWrap: { borderRadius: 14, overflow: "hidden", marginTop: -4 }, primaryButton: { height: 55, flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 10 }, primaryText: { color: "white", fontFamily: "DMSans_600SemiBold", fontSize: 14 }, privacyRow: { flexDirection: "row", justifyContent: "center", alignItems: "center", gap: 6, marginTop: -13 }, privacyText: { color: c.faint, fontFamily: "DMSans_400Regular", fontSize: 8.5, textAlign: "center" },
+    transcriptCard: { flex: 1, minHeight: 535, borderRadius: 20, borderWidth: 1, borderColor: c.border, backgroundColor: c.panel, overflow: "hidden" }, transcriptHeader: { height: 88, paddingHorizontal: 22, flexDirection: "row", alignItems: "center", justifyContent: "space-between", borderBottomWidth: 1, borderBottomColor: c.border }, panelEyebrow: { color: c.faint, fontFamily: "DMSans_700Bold", fontSize: 8, letterSpacing: 1.7 }, panelTitle: { color: c.softText, fontFamily: "DMSans_600SemiBold", fontSize: 15, marginTop: 5 }, liveBadge: { paddingHorizontal: 10, height: 25, borderRadius: 12.5, backgroundColor: "rgba(229,72,103,0.13)", flexDirection: "row", alignItems: "center", gap: 6 }, idleBadge: { backgroundColor: c.raised }, liveDot: { width: 6, height: 6, borderRadius: 3, backgroundColor: "#F15E78" }, idleDot: { backgroundColor: c.muted }, liveText: { color: "#E0526D", fontFamily: "DMSans_700Bold", fontSize: 8, letterSpacing: 1 }, idleText: { color: c.muted },
+    waveform: { height: 91, paddingHorizontal: 22, flexDirection: "row", alignItems: "center", justifyContent: "space-between" }, waveBar: { width: 3, borderRadius: 3, backgroundColor: "#8E6EE0" }, timelineRow: { flexDirection: "row", alignItems: "center", gap: 10, paddingHorizontal: 22, paddingBottom: 18 }, timeText: { color: c.faint, fontFamily: "DMSans_500Medium", fontSize: 8 }, timeline: { flex: 1, height: 1, backgroundColor: c.border }, transcriptScroll: { flex: 1, borderTopWidth: 1, borderTopColor: c.border }, transcriptContent: { flexGrow: 1, padding: 22 }, emptyTranscript: { flex: 1, minHeight: 230, alignItems: "center", justifyContent: "center", paddingHorizontal: 32 }, emptyIcon: { width: 55, height: 55, borderRadius: 27.5, backgroundColor: c.raised, alignItems: "center", justifyContent: "center", marginBottom: 14 }, emptyTitle: { color: c.body, fontFamily: "DMSans_600SemiBold", fontSize: 13 }, emptyCopy: { color: c.faint, fontFamily: "DMSans_400Regular", fontSize: 10.5, lineHeight: 16, textAlign: "center", marginTop: 6 }, segmentRow: { flexDirection: "row", marginBottom: 19 }, segmentTime: { width: 42, color: c.faint, fontFamily: "DMSans_500Medium", fontSize: 9, paddingTop: 2 }, speakerLine: { width: 2, borderRadius: 2, marginRight: 12 }, segmentBody: { flex: 1 }, segmentMeta: { flexDirection: "row", alignItems: "center", gap: 7, marginBottom: 4 }, speakerName: { fontFamily: "DMSans_700Bold", fontSize: 9, textTransform: "uppercase", letterSpacing: 0.7 }, languageTag: { color: c.faint, backgroundColor: c.raised, borderRadius: 7, overflow: "hidden", paddingHorizontal: 6, paddingVertical: 2, fontFamily: "DMSans_600SemiBold", fontSize: 7.5, textTransform: "uppercase", letterSpacing: 0.5 }, segmentText: { color: c.body, fontFamily: "DMSans_400Regular", fontSize: 12.5, lineHeight: 19 },
+    audioPlayer: { marginHorizontal: 22, marginBottom: 16, flexDirection: "row", alignItems: "center", gap: 10 }, audioPlayButton: { width: 32, height: 32, borderRadius: 16, backgroundColor: "#755BD0", alignItems: "center", justifyContent: "center" }, audioProgressTrack: { flex: 1, height: 4, borderRadius: 2, backgroundColor: c.raised, overflow: "hidden" }, audioProgressFill: { height: "100%", borderRadius: 2, backgroundColor: "#9F7AEA" }, audioTime: { minWidth: 72, color: c.faint, fontFamily: "DMSans_500Medium", fontSize: 8, textAlign: "right" },
+    historyPage: { paddingHorizontal: 22, paddingTop: 48, paddingBottom: 110 }, historyLayout: { width: "100%", maxWidth: 1180, alignSelf: "center", gap: 22 }, historyLayoutWide: { flexDirection: "row" }, historyList: { flex: 0.85, gap: 9 }, historyItem: { minHeight: 75, borderRadius: 14, borderWidth: 1, borderColor: c.border, backgroundColor: c.surface, paddingHorizontal: 14, flexDirection: "row", alignItems: "center" }, historyItemSelected: { borderColor: "#745FC0", backgroundColor: c.selected }, historyIcon: { width: 40, height: 40, borderRadius: 11, backgroundColor: c.purpleSurface, alignItems: "center", justifyContent: "center", marginRight: 12 }, historyBody: { flex: 1 }, historyTitle: { color: c.softText, fontFamily: "DMSans_600SemiBold", fontSize: 12.5 }, historyMeta: { color: c.faint, fontFamily: "DMSans_400Regular", fontSize: 9.5, marginTop: 4 },
+    mobileNav: { position: "absolute", bottom: 0, left: 0, right: 0, height: Platform.OS === "ios" ? 82 : 68, paddingBottom: Platform.OS === "ios" ? 15 : 3, borderTopWidth: 1, borderTopColor: c.border, backgroundColor: c.header, flexDirection: "row", justifyContent: "space-around", alignItems: "center" }, mobileNavItem: { width: 90, alignItems: "center", gap: 2 }, mobileNavText: { color: c.faint, fontFamily: "DMSans_500Medium", fontSize: 9 }, mobileNavTextActive: { color: c.purpleText },
+  });
+}

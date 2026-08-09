@@ -1,0 +1,32 @@
+{
+  "expo": {
+    "name": "HelaScribe",
+    "slug": "helascribe",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "dark",
+    "scheme": "helascribe",
+    "web": {
+      "bundler": "metro",
+      "output": "single"
+    },
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.helascribe.app"
+    },
+    "android": {
+      "package": "com.helascribe.app"
+    },
+    "plugins": [
+      [
+        "expo-audio",
+        {
+          "microphonePermission": "Allow HelaScribe to transcribe your voice.",
+          "recordAudioAndroid": true
+        }
+      ],
+      "expo-document-picker",
+      "expo-asset"
+    ]
+  }
+}
