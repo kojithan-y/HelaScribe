@@ -1,0 +1,38 @@
+# Environment files and secrets
+**/.env
+**/.env.*
+!**/.env.example
+**/*service-account*.json
+**/google-services.json
+**/*.jks
+**/*.keystore
+
+# JavaScript / Expo
+**/node_modules/
+**/.expo/
+**/dist/
+**/*.apk
+
+# Python
+**/.venv/
+**/__pycache__/
+**/*.py[cod]
+**/.pytest_cache/
+backend/data/
+
+# Native build output
+**/build/
+**/.gradle/
+**/.cxx/
+**/local.properties
+**/*.iml
+
+# Editors and operating systems
+**/.idea/
+.vscode/
+**/.DS_Store
+**/Thumbs.db
+
+# Local logs
+**/*.log
+
