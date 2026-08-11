@@ -1,5 +1,8 @@
+import asyncio
 import json
+import re
 from google import genai
+from google.genai import errors
 from google.genai import types
 
 from app.core.config import get_settings
@@ -40,6 +43,20 @@ REQUESTED_SPOKEN_LANGUAGE = {
     Language.tamil: SpokenLanguage.tamil,
     Language.english: SpokenLanguage.english,
 }
+
+RETRYABLE_API_CODES = {429, 500, 502, 503, 504}
+
+
+def _load_response_json(value: str) -> dict:
+    """Parse model JSON while preserving literal malformed backslash sequences."""
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        # Model-written transcript text can contain a literal ``\u`` that is
+        # not a JSON unicode escape. Escape only malformed sequences and retry.
+        repaired = re.sub(r"\\u(?![0-9a-fA-F]{4})", r"\\\\u", value)
+        repaired = re.sub(r'\\(?!["\\/bfnrtu])', r"\\\\", repaired)
+        return json.loads(repaired)
 
 
 def detect_script_language(text: str) -> SpokenLanguage:
@@ -108,6 +125,7 @@ class GeminiService:
         timestamp_offset: float = 0.0,
         include_speakers: bool = False,
         audio_duration_seconds: float | None = None,
+        request_timeout_seconds: float | None = None,
     ) -> list[TranscriptSegment]:
         speaker_guidance = (
             "Assign stable anonymous labels SPEAKER_00, SPEAKER_01, and so on to "
@@ -124,19 +142,39 @@ class GeminiService:
             f"{speaker_guidance} "
             "Use seconds relative to the start of this audio clip for start and end."
         )
-        response = await self.client.aio.models.generate_content(
-            model=model or self.settings.gemini_batch_model,
-            contents=[
-                types.Part.from_bytes(data=audio, mime_type=mime_type),
-                types.Part.from_text(text=prompt),
-            ],
-            config=types.GenerateContentConfig(
-                temperature=0.0,
-                audio_timestamp=True,
-                response_mime_type="application/json",
-                response_schema=GeminiTranscript,
-            ),
-        )
+        timeout_seconds = request_timeout_seconds or self.settings.gemini_batch_timeout_seconds
+        for attempt in range(self.settings.gemini_max_retries + 1):
+            try:
+                response = await asyncio.wait_for(
+                    self.client.aio.models.generate_content(
+                        model=model or self.settings.gemini_batch_model,
+                        contents=[
+                            types.Part.from_bytes(data=audio, mime_type=mime_type),
+                            types.Part.from_text(text=prompt),
+                        ],
+                        config=types.GenerateContentConfig(
+                            temperature=0.0,
+                            audio_timestamp=True,
+                            response_mime_type="application/json",
+                            response_schema=GeminiTranscript,
+                        ),
+                    ),
+                    timeout=timeout_seconds,
+                )
+                break
+            except TimeoutError as exc:
+                raise RuntimeError(
+                    f"Gemini transcription timed out after {timeout_seconds:g} seconds"
+                ) from exc
+            except errors.APIError as exc:
+                if (
+                    exc.code not in RETRYABLE_API_CODES
+                    or attempt >= self.settings.gemini_max_retries
+                ):
+                    raise
+                await asyncio.sleep(
+                    self.settings.gemini_retry_base_seconds * (2**attempt)
+                )
         if getattr(response, "parsed", None):
             parsed = response.parsed
             if isinstance(parsed, GeminiTranscript):
@@ -144,7 +182,7 @@ class GeminiService:
             else:
                 segments = GeminiTranscript.model_validate(parsed).segments
         else:
-            data = json.loads(response.text or '{"segments": []}')
+            data = _load_response_json(response.text or '{"segments": []}')
             segments = GeminiTranscript.model_validate(data).segments
         normalized = sorted(
             (item for item in segments if item.text),

@@ -20,12 +20,22 @@ class Settings(BaseSettings):
     gcp_location: str = "global"
     gemini_live_model: str = "gemini-3.5-flash"
     gemini_batch_model: str = "gemini-3.5-flash"
+    gemini_max_retries: int = 3
+    gemini_retry_base_seconds: float = 1.0
+    gemini_live_timeout_seconds: float = 30.0
+    gemini_batch_timeout_seconds: float = 90.0
     live_chunk_seconds: float = 8.0
     live_chunk_overlap_seconds: float = 1.0
+    live_stop_preview_grace_seconds: float = 3.0
     live_silence_rms_threshold: float = 200.0
     live_finalize_full_audio: bool = True
     max_live_minutes: float = 120.0
     max_upload_mb: int = 20
+
+    livekit_url: str | None = None
+    livekit_api_key: str | None = None
+    livekit_api_secret: str | None = None
+    livekit_token_minutes: int = 120
 
     huggingface_token: str | None = None
     pyannote_model: str = "pyannote/speaker-diarization-community-1"

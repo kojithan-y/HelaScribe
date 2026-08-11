@@ -104,3 +104,7 @@ async def delete_history(record_id: str) -> None:
         audio_path = get_settings().data_dir / "audio" / Path(record.audio_filename).name
         if audio_path.is_file():
             await asyncio.to_thread(audio_path.unlink)
+    for filename in record.participant_audio.values():
+        audio_path = get_settings().data_dir / "audio" / Path(filename).name
+        if audio_path.is_file():
+            await asyncio.to_thread(audio_path.unlink)

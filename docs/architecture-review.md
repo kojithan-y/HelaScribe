@@ -9,6 +9,7 @@ Keep the two-stage design:
 1. Gemini provides script-preserving transcription for Sinhala, Tamil, English, and three-language code-switching.
 2. Gemini provides anonymous speaker labels in the authoritative pass when requested; pyannote Community-1 refines them with language-independent diarization after the transcript is stable.
 3. Record and Upload use one full-audio pass. Live uses short provisional chunks for responsiveness, then a full-audio quality pass at stop and finally diarization.
+4. Optional multi-user Meeting sessions use LiveKit Cloud as transport only. Each remote participant remains a separate audio track; Gemini still performs recognition, and pyannote is restricted to tracks explicitly marked as shared microphones.
 
 This deliberately separates *what was said* from *who spoke when*. Speaker labels such as `SPEAKER_00` differentiate voices; they do not identify a person's real-world identity. Named identity requires an explicit enrollment/voiceprint and consent design.
 
@@ -53,6 +54,7 @@ Before exposing the service to multiple users, add:
 5. Manual speaker rename and optional consented voice enrollment if “identify” must mean a person's name rather than anonymous voice separation.
 6. Transcript correction, search, export (TXT/SRT/VTT/DOCX), vocabulary hints, confidence/uncertain-span review, and accessibility testing.
 7. Replace the deprecated browser `ScriptProcessorNode` capture path with AudioWorklet for public-scale web use.
+8. Replace the Meeting POC's in-process room registry and host secret with authenticated users, durable meeting state, expiring invitations, worker supervision, quotas, and abandoned-room cleanup.
 
 ## Evaluation gate
 

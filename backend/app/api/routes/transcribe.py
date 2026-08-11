@@ -8,7 +8,14 @@ from fastapi import APIRouter, File, Form, HTTPException, UploadFile, status
 
 from app.api.routes.history import save_record
 from app.core.config import get_settings
-from app.models.schemas import JobAccepted, JobStatus, Language, SessionType, TranscriptRecord
+from app.models.schemas import (
+    JobAccepted,
+    JobStatus,
+    Language,
+    ProcessingStage,
+    SessionType,
+    TranscriptRecord,
+)
 from app.services.audio_service import wav_rms
 from app.services.diarization_service import diarize_file, merge_transcript_and_speakers
 from app.services.gemini_service import GeminiService
@@ -61,6 +68,7 @@ def _wav_duration(audio: bytes) -> float | None:
 
 async def _process(record: TranscriptRecord, path: Path, mime_type: str) -> None:
     record.status = JobStatus.processing
+    record.processing_stage = ProcessingStage.transcribing
     await save_record(record)
     try:
         audio = await asyncio.to_thread(path.read_bytes)
@@ -81,6 +89,8 @@ async def _process(record: TranscriptRecord, path: Path, mime_type: str) -> None
             )
         record.segments = transcript
         if record.diarization and transcript:
+            record.processing_stage = ProcessingStage.diarizing
+            await save_record(record)
             try:
                 # Local inference refines Gemini's fallback labels only after
                 # the authoritative transcript is complete.
@@ -103,8 +113,10 @@ async def _process(record: TranscriptRecord, path: Path, mime_type: str) -> None
             for segment in record.segments
         )
         record.status = JobStatus.completed
+        record.processing_stage = None
     except Exception as exc:
         record.status = JobStatus.failed
+        record.processing_stage = None
         record.error = str(exc)
     finally:
         await save_record(record)
@@ -119,8 +131,8 @@ async def transcribe_audio(
     title: str = Form("Untitled transcript", max_length=200),
     duration_seconds: float | None = Form(default=None, gt=0, le=28_800),
 ) -> JobAccepted:
-    if session_type == SessionType.live:
-        raise HTTPException(status_code=400, detail="Use /api/live for live sessions")
+    if session_type in (SessionType.live, SessionType.meeting):
+        raise HTTPException(status_code=400, detail="Use the realtime API for this session type")
     suffix = Path(file.filename or "audio.wav").suffix.lower() or ".wav"
     if suffix not in ALLOWED_AUDIO_SUFFIXES:
         raise HTTPException(

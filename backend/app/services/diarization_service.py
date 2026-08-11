@@ -1,5 +1,7 @@
 import asyncio
+import subprocess
 from functools import lru_cache
+from pathlib import Path
 from typing import Any
 
 from app.core.config import get_settings
@@ -15,15 +17,56 @@ def _load_pipeline() -> Any:
         )
     # Lazy loading keeps the API and non-diarization paths usable on hosts that
     # intentionally do not install the large optional inference stack.
+    import torch
     from pyannote.audio import Pipeline
+    from pyannote.audio.core.task import Problem, Resolution, Specifications
+
+    # PyTorch 2.6+ defaults checkpoint loading to weights_only=True. The
+    # official Community-1 checkpoint contains this pyannote metadata class,
+    # so allowlist that specific type rather than disabling safe loading.
+    torch.serialization.add_safe_globals([Specifications, Problem, Resolution])
 
     return Pipeline.from_pretrained(
         settings.pyannote_model, token=settings.huggingface_token
     )
 
 
+def _decode_audio(path: str) -> dict[str, Any]:
+    """Decode to mono 16 kHz in memory, bypassing TorchCodec on Windows."""
+    import numpy as np
+    import torch
+    from imageio_ffmpeg import get_ffmpeg_exe
+
+    completed = subprocess.run(
+        [
+            get_ffmpeg_exe(),
+            "-v",
+            "error",
+            "-i",
+            str(Path(path).resolve()),
+            "-vn",
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            "-f",
+            "f32le",
+            "pipe:1",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    samples = np.frombuffer(completed.stdout, dtype="<f4").copy()
+    if samples.size == 0:
+        raise ValueError("Audio decoder produced no samples")
+    return {
+        "waveform": torch.from_numpy(samples).unsqueeze(0),
+        "sample_rate": 16_000,
+    }
+
+
 def _run_pipeline(path: str) -> list[TranscriptSegment]:
-    output = _load_pipeline()(path)
+    output = _load_pipeline()(_decode_audio(path))
     # Community-1's exclusive timeline guarantees a single active speaker and
     # is specifically intended for reconciling diarization with ASR timestamps.
     annotation = getattr(
@@ -51,6 +94,15 @@ def _run_pipeline(path: str) -> list[TranscriptSegment]:
 async def diarize_file(path: str) -> list[TranscriptSegment]:
     """Run gated pyannote inference without blocking FastAPI's event loop."""
     return await asyncio.to_thread(_run_pipeline, path)
+
+
+async def warm_up_diarization() -> bool:
+    """Preload the pyannote pipeline so the first job avoids model-load latency."""
+    settings = get_settings()
+    if not settings.huggingface_token:
+        return False
+    await asyncio.to_thread(_load_pipeline)
+    return True
 
 
 def merge_transcript_and_speakers(

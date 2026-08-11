@@ -37,6 +37,9 @@ API routes:
 
 - `POST /api/transcribe` — multipart Record/Upload job; returns `202`
 - `WS /api/live` — raw mono PCM16 WebSocket stream
+- `POST /api/meetings` — create an optional LiveKit Cloud meeting
+- `POST /api/meetings/{code}/join` — join with a participant-scoped token
+- `POST /api/meetings/{code}/end` — host-only meeting finalization
 - `GET /api/history` and `GET /api/history/{id}` — job/history polling
 - `DELETE /api/history/{id}` — remove a history entry
 - `GET /health` — health check
@@ -65,6 +68,33 @@ Firewall may prompt you to allow Node.js and Python on private networks.
 `npm run android:native` remains available for a locally built development client, but
 it is not needed for Expo Go.
 
+Meeting mode is the exception: LiveKit uses native WebRTC code and therefore does not
+run in Expo Go. Use `npm run android:native` (or `npm run android:build`) for Android
+Meeting tests. Record, Upload, and single-device Live continue to work without LiveKit.
+The default `npm run start` bundle deliberately excludes native LiveKit modules so Expo
+Go remains compatible. After installing the development build, use
+`npm run start:dev-client` to serve a bundle with native Meeting support enabled.
+
+## Optional multi-user Meeting mode
+
+Create a LiveKit Cloud project and add these values to `backend/.env`:
+
+```env
+LIVEKIT_URL=wss://your-project.livekit.cloud
+LIVEKIT_API_KEY=your_key
+LIVEKIT_API_SECRET=your_secret
+```
+
+Meeting mode uses LiveKit only for rooms, WebRTC audio tracks, participant identity,
+reconnection, and transcript data events. A hidden backend participant subscribes to
+each microphone track and reuses the existing Gemini chunk preview. When the host ends
+the meeting, each retained participant track receives a full-audio Gemini pass and the
+results are merged on the common room timeline. Tracks marked as shared microphones are
+the only tracks sent through pyannote.
+
+This is intentionally a POC: room state and host secrets are in process, there is no
+user authentication, and a backend restart invalidates active room codes.
+
 Useful checks:
 
 ```bash
@@ -75,6 +105,7 @@ npm run build:web
 ## Processing behavior
 
 - Live PCM is transcribed in overlapping chunks by Gemini 3.5 Flash as a provisional preview. Overlap prevents words at chunk boundaries from being cut in half; midpoint filtering prevents duplicate preview segments.
+- Meeting audio uses the same preview/final models per LiveKit participant track. Remote participants use their stable LiveKit identity; shared-device tracks optionally add pyannote speaker labels.
 - On stop, recordings within the configured inline-size limit are transcribed once more as a complete file by Gemini 3.5 Flash. This authoritative pass removes chunk-boundary errors; if it is unavailable, the preview is retained with a warning.
 - When speaker identification is enabled, the authoritative Gemini pass returns stable anonymous speaker labels. Community-1 then refines them with its exclusive timeline; if the local model cannot safely load, the Gemini labels remain available with a warning.
 - Record/Upload uses one Gemini 3.5 Flash pass. With diarization enabled, Community-1 starts only after Gemini finishes, then both outputs are merged by maximum timestamp overlap.

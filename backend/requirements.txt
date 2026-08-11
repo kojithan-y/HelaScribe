@@ -4,4 +4,7 @@ python-multipart==0.0.20
 pydantic-settings==2.10.1
 google-genai==2.13.0
 google-auth>=2.56.0,<3.0.0
-pyannote.audio==4.0.1
+pyannote.audio==4.0.2
+imageio-ffmpeg>=0.6,<1
+livekit==1.1.13
+livekit-api==1.2.0

@@ -42,6 +42,78 @@ def test_overlap_commits_each_segment_once_by_midpoint() -> None:
     assert live._is_committed_segment(boundary_word, 8.0) is True
 
 
+def test_preview_queue_can_be_skipped_when_full_audio_will_replace_it(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        live,
+        "get_settings",
+        lambda: SimpleNamespace(live_finalize_full_audio=True, max_upload_mb=20),
+    )
+
+    assert live._can_finalize_from_full_audio(1_000_000) is True
+
+
+def test_preview_queue_is_drained_when_final_pass_is_unavailable(monkeypatch) -> None:
+    monkeypatch.setattr(
+        live,
+        "get_settings",
+        lambda: SimpleNamespace(live_finalize_full_audio=False, max_upload_mb=20),
+    )
+    assert live._can_finalize_from_full_audio(1_000_000) is False
+
+    monkeypatch.setattr(
+        live,
+        "get_settings",
+        lambda: SimpleNamespace(live_finalize_full_audio=True, max_upload_mb=1),
+    )
+    assert live._can_finalize_from_full_audio(2_000_000) is False
+
+
+def test_live_chunk_requests_provisional_gemini_speakers(monkeypatch) -> None:
+    calls: list[dict] = []
+
+    class FakeGemini:
+        async def transcribe_file(self, *_args, **kwargs):
+            calls.append(kwargs)
+            return []
+
+    monkeypatch.setattr(
+        live,
+        "get_settings",
+        lambda: SimpleNamespace(
+            gemini_live_model="live-model",
+            gemini_live_timeout_seconds=12.0,
+        ),
+    )
+    record = TranscriptRecord(
+        title="Live test",
+        language=Language.english,
+        session_type=SessionType.live,
+        diarization=True,
+    )
+
+    asyncio.run(
+        live._transcribe_live_chunk(
+            FakeGemini(),
+            b"\x00\x00" * 16_000,
+            16_000,
+            record,
+            7.0,
+        )
+    )
+
+    assert calls == [
+        {
+            "model": "live-model",
+            "timestamp_offset": 7.0,
+            "include_speakers": True,
+            "audio_duration_seconds": 1.0,
+            "request_timeout_seconds": 12.0,
+        }
+    ]
+
+
 def test_finalize_preserves_transcript_when_diarization_fails(monkeypatch) -> None:
     record = TranscriptRecord(
         title="Live test",

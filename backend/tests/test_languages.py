@@ -1,10 +1,17 @@
 from app.models.schemas import Language, SpokenLanguage, TranscriptSegment
 from app.services.gemini_service import (
     LANGUAGE_GUIDANCE,
+    _load_response_json,
     bound_segments_to_duration,
     detect_script_language,
     normalize_language_segments,
 )
+
+
+def test_malformed_literal_unicode_escape_is_repaired() -> None:
+    result = _load_response_json(r'{"segments": [{"text": "C:\users"}]}')
+
+    assert result["segments"][0]["text"] == r"C:\users"
 
 
 def segment(text: str) -> TranscriptSegment:

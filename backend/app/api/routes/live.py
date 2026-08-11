@@ -1,6 +1,8 @@
 import asyncio
 import io
+import logging
 import wave
+from contextlib import suppress
 from pathlib import Path
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
@@ -10,6 +12,7 @@ from app.core.config import get_settings
 from app.models.schemas import (
     JobStatus,
     LiveStart,
+    ProcessingStage,
     SessionType,
     TranscriptRecord,
     TranscriptSegment,
@@ -19,6 +22,8 @@ from app.services.diarization_service import diarize_file, merge_transcript_and_
 from app.services.gemini_service import GeminiService
 
 router = APIRouter(tags=["live"])
+logger = logging.getLogger(__name__)
+_background_tasks: set[asyncio.Task[None]] = set()
 
 
 def _pcm_wav_bytes(pcm: bytes, sample_rate: int) -> bytes:
@@ -39,11 +44,55 @@ def _is_committed_segment(segment: TranscriptSegment, commit_after: float) -> bo
     return (segment.start + segment.end) / 2 >= commit_after
 
 
+def _can_finalize_from_full_audio(pcm_size: int) -> bool:
+    """Return whether the final pass can safely replace unfinished previews."""
+    settings = get_settings()
+    wav_header_size = 44
+    return (
+        settings.live_finalize_full_audio
+        and pcm_size + wav_header_size <= settings.max_upload_mb * 1024 * 1024
+    )
+
+
+def _start_background_finalization(record: TranscriptRecord, path: Path) -> None:
+    """Keep a strong reference until background finalization completes."""
+    task = asyncio.create_task(_finalize_live(record, path))
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+
+async def _transcribe_live_chunk(
+    gemini: GeminiService,
+    chunk: bytes,
+    sample_rate: int,
+    record: TranscriptRecord,
+    offset: float,
+) -> list[TranscriptSegment]:
+    settings = get_settings()
+    return await gemini.transcribe_file(
+        _pcm_wav_bytes(chunk, sample_rate),
+        "audio/wav",
+        record.language,
+        model=settings.gemini_live_model,
+        timestamp_offset=offset,
+        include_speakers=record.diarization,
+        audio_duration_seconds=len(chunk) / (sample_rate * 2),
+        request_timeout_seconds=settings.gemini_live_timeout_seconds,
+    )
+
+
 async def _finalize_live(record: TranscriptRecord, path: Path) -> None:
     record.status = JobStatus.processing
+    settings = get_settings()
+    record.processing_stage = (
+        ProcessingStage.transcribing
+        if settings.live_finalize_full_audio
+        else ProcessingStage.diarizing
+        if record.diarization and record.segments
+        else ProcessingStage.saving_audio
+    )
     await save_record(record)
     try:
-        settings = get_settings()
         if settings.live_finalize_full_audio:
             # Chunk results are a low-latency preview. Re-transcribe the retained
             # recording once so chunk boundaries cannot corrupt the final result.
@@ -63,6 +112,7 @@ async def _finalize_live(record: TranscriptRecord, path: Path) -> None:
                         include_speakers=record.diarization,
                         audio_duration_seconds=record.duration_seconds,
                     )
+                    record.error = None
                 else:
                     record.error = (
                         "Full-session quality pass skipped because the recording "
@@ -72,6 +122,8 @@ async def _finalize_live(record: TranscriptRecord, path: Path) -> None:
                 record.segments = preview_segments
                 record.error = f"Full-session quality pass unavailable: {exc}"
         if record.diarization and record.segments:
+            record.processing_stage = ProcessingStage.diarizing
+            await save_record(record)
             try:
                 speakers = await diarize_file(str(path))
                 record.segments = merge_transcript_and_speakers(record.segments, speakers)
@@ -92,8 +144,10 @@ async def _finalize_live(record: TranscriptRecord, path: Path) -> None:
             for item in record.segments
         )
         record.status = JobStatus.completed
+        record.processing_stage = None
     except Exception as exc:
         record.status = JobStatus.failed
+        record.processing_stage = None
         record.error = str(exc)
     await save_record(record)
 
@@ -114,6 +168,7 @@ async def live_transcription(websocket: WebSocket) -> None:
             session_type=SessionType.live,
             diarization=start.diarization,
             status=JobStatus.processing,
+            processing_stage=ProcessingStage.recording,
             audio_filename="pending.wav",
         )
         record.audio_filename = f"{record.id}.wav"
@@ -129,6 +184,7 @@ async def live_transcription(websocket: WebSocket) -> None:
         queue: asyncio.Queue[tuple[bytes, float, float] | None] = asyncio.Queue()
 
         async def transcribe_chunks() -> None:
+            warning_sent = False
             while True:
                 queued = await queue.get()
                 if queued is None:
@@ -136,14 +192,30 @@ async def live_transcription(websocket: WebSocket) -> None:
                 chunk, offset, commit_after = queued
                 if _pcm_rms(chunk) < settings.live_silence_rms_threshold:
                     continue
-                segments = await gemini.transcribe_file(
-                    _pcm_wav_bytes(chunk, start.sample_rate),
-                    "audio/wav",
-                    start.language,
-                    model=settings.gemini_live_model,
-                    timestamp_offset=offset,
-                    audio_duration_seconds=len(chunk) / (start.sample_rate * 2),
-                )
+                try:
+                    segments = await _transcribe_live_chunk(
+                        gemini,
+                        chunk,
+                        start.sample_rate,
+                        record,
+                        offset,
+                    )
+                except Exception as exc:
+                    # A transient Gemini/quota failure must not terminate the
+                    # microphone WebSocket. The final full-audio pass can fill
+                    # any preview gap after the user stops the session.
+                    logger.warning("Live chunk transcription skipped: %s", exc)
+                    record.error = f"Live preview delayed: {exc}"
+                    await save_record(record)
+                    if not warning_sent:
+                        await websocket.send_json(
+                            {
+                                "type": "warning",
+                                "message": "Live preview is delayed; audio is still recording",
+                            }
+                        )
+                        warning_sent = True
+                    continue
                 for segment in segments:
                     if not _is_committed_segment(segment, commit_after):
                         continue
@@ -181,21 +253,43 @@ async def live_transcription(websocket: WebSocket) -> None:
                     first_chunk = False
             elif message.get("text") == "stop":
                 stopped = True
-                if pending:
-                    offset = queued_bytes / (start.sample_rate * 2)
-                    commit_after = 0.0 if first_chunk else offset + settings.live_chunk_overlap_seconds
-                    await queue.put((bytes(pending), offset, commit_after))
-                    queued_bytes += len(pending)
+                if _can_finalize_from_full_audio(len(pcm)):
+                    # The authoritative full-audio pass will cover the entire
+                    # recording. Give only the in-flight preview a short chance
+                    # to finish, then stop waiting for stale preview calls.
                     pending.clear()
-                await queue.put(None)
-                await worker
+                    while not queue.empty():
+                        queue.get_nowait()
+                    await queue.put(None)
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.shield(worker),
+                            timeout=settings.live_stop_preview_grace_seconds,
+                        )
+                    except TimeoutError:
+                        worker.cancel()
+                        with suppress(asyncio.CancelledError):
+                            await worker
+                else:
+                    # Preserve the old drain behavior when the full pass is
+                    # disabled or the recording is too large for inline input.
+                    if pending:
+                        offset = queued_bytes / (start.sample_rate * 2)
+                        commit_after = 0.0 if first_chunk else offset + settings.live_chunk_overlap_seconds
+                        await queue.put((bytes(pending), offset, commit_after))
+                        queued_bytes += len(pending)
+                        pending.clear()
+                    await queue.put(None)
+                    await worker
                 break
 
         path = settings.data_dir / "audio" / record.audio_filename
+        record.processing_stage = ProcessingStage.saving_audio
+        await save_record(record)
         await asyncio.to_thread(_write_pcm_wav, path, bytes(pcm), start.sample_rate)
         record.duration_seconds = len(pcm) / (start.sample_rate * 2)
         await save_record(record)
-        asyncio.create_task(_finalize_live(record, path))
+        _start_background_finalization(record, path)
         await websocket.send_json({"type": "finalizing", "id": record.id})
         await websocket.close()
     except WebSocketDisconnect:
@@ -203,6 +297,7 @@ async def live_transcription(websocket: WebSocket) -> None:
     except Exception as exc:
         if record:
             record.status = JobStatus.failed
+            record.processing_stage = None
             record.error = str(exc)
             await save_record(record)
         try:
@@ -215,5 +310,6 @@ async def live_transcription(websocket: WebSocket) -> None:
             worker.cancel()
         if record and not stopped and record.status == JobStatus.processing:
             record.status = JobStatus.failed
+            record.processing_stage = None
             record.error = "Live connection closed before the session was stopped"
             await save_record(record)

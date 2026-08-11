@@ -16,6 +16,7 @@ class SessionType(str, Enum):
     record = "Record"
     live = "Live"
     upload = "Upload"
+    meeting = "Meeting"
 
 
 class JobStatus(str, Enum):
@@ -23,6 +24,13 @@ class JobStatus(str, Enum):
     processing = "processing"
     completed = "completed"
     failed = "failed"
+
+
+class ProcessingStage(str, Enum):
+    recording = "recording"
+    saving_audio = "saving_audio"
+    transcribing = "transcribing"
+    diarizing = "diarizing"
 
 
 class SpokenLanguage(str, Enum):
@@ -38,6 +46,7 @@ class TranscriptSegment(BaseModel):
     text: str
     speaker: str | None = None
     detected_language: SpokenLanguage | None = None
+    participant_identity: str | None = None
 
     @model_validator(mode="after")
     def validate_timeline(self) -> "TranscriptSegment":
@@ -47,6 +56,12 @@ class TranscriptSegment(BaseModel):
         return self
 
 
+class MeetingParticipant(BaseModel):
+    identity: str
+    display_name: str
+    shared_mic: bool = False
+
+
 class TranscriptRecord(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid4()))
     title: str
@@ -54,10 +69,13 @@ class TranscriptRecord(BaseModel):
     session_type: SessionType
     diarization: bool = False
     status: JobStatus = JobStatus.queued
+    processing_stage: ProcessingStage | None = None
     transcript: str = ""
     segments: list[TranscriptSegment] = Field(default_factory=list)
     duration_seconds: float | None = None
     audio_filename: str | None = None
+    participant_audio: dict[str, str] = Field(default_factory=dict)
+    participants: list[MeetingParticipant] = Field(default_factory=list)
     error: str | None = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
@@ -77,3 +95,29 @@ class LiveStart(BaseModel):
 
 class GeminiTranscript(BaseModel):
     segments: list[TranscriptSegment]
+
+
+class MeetingCreate(BaseModel):
+    display_name: str = Field(min_length=1, max_length=80)
+    language: Language
+    shared_mic: bool = False
+
+
+class MeetingJoin(BaseModel):
+    display_name: str = Field(min_length=1, max_length=80)
+    shared_mic: bool = False
+
+
+class MeetingConnection(BaseModel):
+    livekit_url: str
+    token: str
+    room_code: str
+    meeting_id: str
+    participant_identity: str
+    display_name: str
+    is_host: bool = False
+    host_secret: str | None = None
+
+
+class MeetingEnd(BaseModel):
+    host_secret: str = Field(min_length=1)

@@ -10,6 +10,7 @@ import {
   StyleSheet,
   Switch,
   Text,
+  TextInput,
   View,
   useColorScheme,
   useWindowDimensions,
@@ -36,8 +37,9 @@ import {
   useFonts,
 } from "@expo-google-fonts/dm-sans";
 
-import { getAudioUrl, getHistory, getTranscript, submitAudio, WS_URL } from "./api";
-import type { Language, Segment, SessionType, TranscriptRecord } from "./types";
+import { createMeeting, endMeeting, getAudioUrl, getHistory, getTranscript, joinMeeting, submitAudio, WS_URL } from "./api";
+import type { Language, MeetingConnection, ProcessingStage, Segment, SessionType, TranscriptRecord } from "./types";
+import type { MeetingClient, MeetingParticipantView } from "./livekitMeeting";
 import { startWebAudioStream, type WebAudioStream } from "./webAudioStream";
 
 const LANGUAGES: Array<{ value: Language; native: string }> = [
@@ -56,6 +58,7 @@ const SESSION_TYPES: Array<{
   { value: "Record", label: "Record", hint: "Capture a session", icon: "mic" },
   { value: "Live", label: "Live", hint: "Transcribe as you speak", icon: "radio" },
   { value: "Upload", label: "Upload", hint: "Choose an audio file", icon: "upload-cloud" },
+  { value: "Meeting", label: "Meeting", hint: "Join multiple devices", icon: "users" },
 ];
 
 const waveform = [18, 30, 45, 25, 58, 38, 68, 48, 26, 54, 73, 42, 62, 30, 50, 22, 38, 66, 44, 28, 56, 35, 18];
@@ -73,6 +76,31 @@ function speakerColor(speaker?: string | null) {
     ? Number(numericLabel)
     : [...speaker].reduce((hash, character) => hash + character.charCodeAt(0), 0);
   return ["#A78BFA", "#34D399", "#60A5FA", "#FB7185"][number % 4] ?? "#A78BFA";
+}
+
+const PROCESSING_LABELS: Record<ProcessingStage, string> = {
+  recording: "Recording",
+  saving_audio: "Saving audio",
+  transcribing: "Transcribing",
+  diarizing: "Identifying speakers",
+};
+
+function recordStatusLabel(record: Pick<TranscriptRecord, "status" | "processing_stage">) {
+  if (record.status === "processing" && record.processing_stage) {
+    return PROCESSING_LABELS[record.processing_stage];
+  }
+  if (record.status === "queued") return "Queued";
+  if (record.status === "completed") return "Completed";
+  if (record.status === "failed") return "Failed";
+  return "Processing";
+}
+
+function mergeTranscriptRecords(current: TranscriptRecord[], updates: TranscriptRecord[]) {
+  const records = new Map(current.map((record) => [record.id, record]));
+  updates.forEach((record) => records.set(record.id, record));
+  return [...records.values()].sort(
+    (left, right) => new Date(right.created_at).getTime() - new Date(left.created_at).getTime(),
+  );
 }
 
 type AppStyles = ReturnType<typeof createStyles>;
@@ -155,6 +183,7 @@ function TranscriptPanel({
   segments,
   active,
   status,
+  processingStage,
   duration,
   intensity = 0,
   audioRecordId,
@@ -163,21 +192,30 @@ function TranscriptPanel({
   segments: Segment[];
   active: boolean;
   status: string;
+  processingStage?: ProcessingStage | null;
   duration: number;
   intensity?: number;
   audioRecordId?: string | null;
   styles: AppStyles;
 }) {
+  const isProcessing = !active && (status === "queued" || status === "processing" || Boolean(processingStage));
+  const processingTitle = processingStage ? PROCESSING_LABELS[processingStage] : "Processing transcript";
+  const processingCopy = processingStage === "diarizing"
+    ? "The transcript is ready. Speaker labels are being refined in the background."
+    : processingStage === "saving_audio"
+      ? "Your recording is safe. Preparing it for transcription now."
+      : "Your final transcript is being prepared in the background.";
+  const badgeLabel = active ? "LIVE" : isProcessing ? processingTitle : status;
   return (
     <View style={styles.transcriptCard}>
       <View style={styles.transcriptHeader}>
         <View>
           <Text style={styles.panelEyebrow}>TRANSCRIPT</Text>
-          <Text style={styles.panelTitle}>{active ? "Listening now" : "Your words appear here"}</Text>
+          <Text style={styles.panelTitle}>{active ? "Listening now" : isProcessing ? processingTitle : "Your words appear here"}</Text>
         </View>
         <View style={[styles.liveBadge, !active && styles.idleBadge]}>
           <View style={[styles.liveDot, !active && styles.idleDot]} />
-          <Text style={[styles.liveText, !active && styles.idleText]}>{active ? "LIVE" : status.toUpperCase()}</Text>
+          <Text style={[styles.liveText, !active && styles.idleText]}>{badgeLabel.toUpperCase()}</Text>
         </View>
       </View>
 
@@ -190,12 +228,22 @@ function TranscriptPanel({
 
       {audioRecordId && !active && status === "completed" ? <AudioPlayback recordId={audioRecordId} styles={styles} /> : null}
 
+      {isProcessing ? (
+        <View style={styles.processingCard}>
+          <ActivityIndicator color="#9F7AEA" size="small" />
+          <View style={styles.processingBody}>
+            <Text style={styles.processingTitle}>{processingTitle}</Text>
+            <Text style={styles.processingCopy}>{processingCopy} You can start another recording.</Text>
+          </View>
+        </View>
+      ) : null}
+
       <ScrollView style={styles.transcriptScroll} contentContainerStyle={styles.transcriptContent}>
         {segments.length === 0 ? (
           <View style={styles.emptyTranscript}>
             <View style={styles.emptyIcon}><MaterialCommunityIcons name="waveform" size={26} color="#8F8A9E" /></View>
-            <Text style={styles.emptyTitle}>Ready when you are</Text>
-            <Text style={styles.emptyCopy}>Choose your language and session type, then start transcribing.</Text>
+            <Text style={styles.emptyTitle}>{isProcessing ? "Transcript on the way" : "Ready when you are"}</Text>
+            <Text style={styles.emptyCopy}>{isProcessing ? "Your final text will appear here automatically." : "Choose your language and session type, then start transcribing."}</Text>
           </View>
         ) : segments.map((segment, index) => (
           <View key={`${segment.start}-${index}`} style={styles.segmentRow}>
@@ -235,16 +283,22 @@ export default function App() {
   const [diarization, setDiarization] = useState(true);
   const [active, setActive] = useState(false);
   const [status, setStatus] = useState("ready");
+  const [processingStage, setProcessingStage] = useState<ProcessingStage | null>(null);
   const [duration, setDuration] = useState(0);
   const [voiceIntensity, setVoiceIntensity] = useState(0);
   const [segments, setSegments] = useState<Segment[]>([]);
   const [history, setHistory] = useState<TranscriptRecord[]>([]);
   const [selected, setSelected] = useState<TranscriptRecord | null>(null);
-  const [jobId, setJobId] = useState<string | null>(null);
+  const [trackedJobIds, setTrackedJobIds] = useState<string[]>([]);
   const [currentRecordId, setCurrentRecordId] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [meetingName, setMeetingName] = useState("");
+  const [meetingCode, setMeetingCode] = useState("");
+  const [meetingConnection, setMeetingConnection] = useState<MeetingConnection | null>(null);
+  const [meetingParticipants, setMeetingParticipants] = useState<MeetingParticipantView[]>([]);
   const socketRef = useRef<WebSocket | null>(null);
   const webAudioRef = useRef<WebAudioStream | null>(null);
+  const meetingClientRef = useRef<MeetingClient | null>(null);
   const recorder = useAudioRecorder({ ...RecordingPresets.HIGH_QUALITY, isMeteringEnabled: true });
   const recorderState = useAudioRecorderState(recorder, 250);
 
@@ -275,6 +329,7 @@ export default function App() {
   useEffect(() => () => {
     socketRef.current?.close();
     void stopAudioCapture();
+    void meetingClientRef.current?.disconnect();
   }, [stopAudioCapture]);
 
   useEffect(() => {
@@ -291,29 +346,60 @@ export default function App() {
   }, [active, recorderState.metering, sessionType]);
 
   const refreshHistory = useCallback(async () => {
-    try { setHistory(await getHistory()); } catch { /* backend may not be running yet */ }
+    try {
+      const records = await getHistory();
+      setHistory(records);
+      setSelected((current) => records.find((record) => record.id === current?.id) ?? current);
+      const unfinished = records
+        .filter((record) => record.status === "queued" || record.status === "processing")
+        .map((record) => record.id);
+      setTrackedJobIds((current) => [...new Set([...current, ...unfinished])]);
+    } catch { /* backend may not be running yet */ }
+  }, []);
+
+  const trackJob = useCallback((id: string) => {
+    setTrackedJobIds((current) => current.includes(id) ? current : [...current, id]);
   }, []);
 
   useEffect(() => { void refreshHistory(); }, [refreshHistory]);
 
   useEffect(() => {
-    if (!jobId) return;
-    const timer = setInterval(async () => {
-      try {
-        const record = await getTranscript(jobId);
-        setStatus(record.status);
-        setDuration((current) => record.duration_seconds ?? current);
-        if (record.segments.length) setSegments(record.segments);
-        if (record.status === "completed" || record.status === "failed") {
-          setJobId(null);
-          setBusy(false);
-          await refreshHistory();
-          if (record.status === "failed") Alert.alert("Transcription failed", record.error ?? "Unknown error");
-        }
-      } catch { /* retry on the next tick */ }
-    }, 1500);
-    return () => clearInterval(timer);
-  }, [jobId, refreshHistory]);
+    if (trackedJobIds.length === 0) return;
+    let cancelled = false;
+    const poll = async () => {
+      const results = await Promise.allSettled(trackedJobIds.map((id) => getTranscript(id)));
+      if (cancelled) return;
+      const records = results
+        .filter((result): result is PromiseFulfilledResult<TranscriptRecord> => result.status === "fulfilled")
+        .map((result) => result.value);
+      if (records.length === 0) return;
+      setHistory((current) => mergeTranscriptRecords(current, records));
+      setSelected((current) => records.find((record) => record.id === current?.id) ?? current);
+
+      const visible = records.find((record) => record.id === currentRecordId);
+      if (visible && !active) {
+        setStatus(visible.status);
+        setProcessingStage(visible.processing_stage ?? null);
+        setDuration((current) => visible.duration_seconds ?? current);
+        setSegments(visible.segments);
+      }
+
+      const finished = new Set(
+        records
+          .filter((record) => record.status === "completed" || record.status === "failed")
+          .map((record) => record.id),
+      );
+      if (finished.size) {
+        setTrackedJobIds((current) => current.filter((id) => !finished.has(id)));
+      }
+    };
+    void poll();
+    const timer = setInterval(() => void poll(), 1500);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [active, currentRecordId, trackedJobIds]);
 
   const prepareMic = async () => {
     if (Platform.OS === "web") return;
@@ -324,6 +410,8 @@ export default function App() {
 
   const startLive = async () => {
     await prepareMic();
+    setCurrentRecordId(null);
+    setProcessingStage(null);
     setSegments([]);
     setDuration(0);
     setVoiceIntensity(0);
@@ -346,8 +434,9 @@ export default function App() {
         try {
           const message = JSON.parse(String(event.data));
           if (message.type === "ready") {
-            setJobId(message.id);
+            trackJob(message.id);
             setCurrentRecordId(message.id);
+            setProcessingStage("recording");
             if (Platform.OS !== "web") await liveAudio.stream.start();
             setStatus("listening");
             setActive(true);
@@ -355,8 +444,11 @@ export default function App() {
           } else if (message.type === "transcript") {
             setSegments((current) => [...current, message.segment]);
           } else if (message.type === "finalizing") {
-            setJobId(message.id);
-            setStatus("processing");
+            trackJob(message.id);
+            if (socketRef.current === socket) socketRef.current = null;
+            setStatus("stopped - finalizing in background");
+            setProcessingStage("transcribing");
+            setBusy(false);
           } else if (message.type === "error") {
             await stopAudioCapture();
             setActive(false);
@@ -374,6 +466,7 @@ export default function App() {
       })();
     };
     socket.onerror = () => {
+      if (socketRef.current !== socket) return;
       void stopAudioCapture();
       setActive(false);
       setBusy(false);
@@ -381,9 +474,11 @@ export default function App() {
       Alert.alert("Connection failed", `Could not connect to ${WS_URL}`);
     };
     socket.onclose = () => {
-      if (socketRef.current === socket) socketRef.current = null;
-      void stopAudioCapture();
-      setActive(false);
+      if (socketRef.current === socket) {
+        socketRef.current = null;
+        void stopAudioCapture();
+        setActive(false);
+      }
     };
   };
 
@@ -392,13 +487,81 @@ export default function App() {
     socketRef.current?.send("stop");
     setActive(false);
     setBusy(true);
-    setStatus(diarization ? "finalizing speakers" : "saving");
+    setStatus("stopping");
+  };
+
+  const connectToMeeting = async (connection: MeetingConnection) => {
+    setMeetingConnection(connection);
+    setMeetingCode(connection.room_code);
+    setCurrentRecordId(connection.meeting_id);
+    setProcessingStage("recording");
+    trackJob(connection.meeting_id);
+    const { connectMeeting } = await import("helascribe-meeting-connector");
+    const client = await connectMeeting(connection.livekit_url, connection.token, {
+      onConnectionChange: setStatus,
+      onParticipantsChange: setMeetingParticipants,
+      onSegment: (segment) => setSegments((current) => {
+        const duplicate = current.some((item) =>
+          item.participant_identity === segment.participant_identity
+          && item.start === segment.start
+          && item.end === segment.end
+          && item.text === segment.text
+        );
+        return duplicate ? current : [...current, segment].sort((a, b) => a.start - b.start);
+      }),
+      onError: (error) => Alert.alert("Meeting", error.message),
+    });
+    meetingClientRef.current = client;
+    setActive(true);
+    setBusy(false);
+  };
+
+  const startMeeting = async (join: boolean) => {
+    const displayName = meetingName.trim();
+    if (!displayName) throw new Error("Enter your display name");
+    if (join && !meetingCode.trim()) throw new Error("Enter a room code");
+    setBusy(true);
+    setStatus(join ? "joining" : "creating");
+    setCurrentRecordId(null);
+    setProcessingStage(null);
+    setSegments([]);
+    setDuration(0);
+    const connection = join
+      ? await joinMeeting(meetingCode, displayName, diarization)
+      : await createMeeting(displayName, language, diarization);
+    try {
+      await connectToMeeting(connection);
+    } catch (error) {
+      setMeetingConnection(null);
+      setBusy(false);
+      throw error;
+    }
+  };
+
+  const stopMeeting = async () => {
+    const connection = meetingConnection;
+    if (!connection) return;
+    setActive(false);
+    setBusy(connection.is_host);
+    setStatus(connection.is_host ? "finalizing meeting" : "left meeting");
+    if (connection.is_host && connection.host_secret) {
+      const result = await endMeeting(connection.room_code, connection.host_secret);
+      trackJob(result.id);
+      setProcessingStage("saving_audio");
+    }
+    await meetingClientRef.current?.disconnect();
+    meetingClientRef.current = null;
+    setMeetingParticipants([]);
+    setMeetingConnection(null);
+    setBusy(false);
   };
 
   const startRecord = async () => {
     await prepareMic();
+    setCurrentRecordId(null);
     setSegments([]);
     setDuration(0);
+    setProcessingStage("recording");
     await recorder.prepareToRecordAsync();
     recorder.record();
     setStatus("recording");
@@ -414,9 +577,11 @@ export default function App() {
     setBusy(true);
     setStatus("uploading");
     const result = await submitAudio(uri, "recording.m4a", "audio/mp4", language, "Record", diarization, undefined, recordedDuration);
-    setJobId(result.id);
+    trackJob(result.id);
     setCurrentRecordId(result.id);
-    setStatus("queued");
+    setStatus("processing");
+    setProcessingStage("transcribing");
+    setBusy(false);
   };
 
   const chooseUpload = async () => {
@@ -425,13 +590,17 @@ export default function App() {
     const asset = result.assets[0];
     if (!asset) return;
     setBusy(true);
+    setCurrentRecordId(null);
     setSegments([]);
+    setProcessingStage(null);
     setStatus("uploading");
     try {
       const job = await submitAudio(asset.uri, asset.name, asset.mimeType ?? "audio/mpeg", language, "Upload", diarization, asset.file);
-      setJobId(job.id);
+      trackJob(job.id);
       setCurrentRecordId(job.id);
-      setStatus("queued");
+      setStatus("processing");
+      setProcessingStage("transcribing");
+      setBusy(false);
     } catch (error) {
       setBusy(false);
       Alert.alert("Upload failed", error instanceof Error ? error.message : "Unknown error");
@@ -440,6 +609,7 @@ export default function App() {
 
   const handlePrimary = async () => {
     try {
+      if (sessionType === "Meeting") return active ? await stopMeeting() : await startMeeting(false);
       if (active) return sessionType === "Live" ? await stopLive() : await stopRecord();
       if (sessionType === "Upload") return await chooseUpload();
       if (sessionType === "Live") return await startLive();
@@ -450,13 +620,20 @@ export default function App() {
         socketRef.current?.close();
         socketRef.current = null;
       }
+      if (sessionType === "Meeting") {
+        await meetingClientRef.current?.disconnect();
+        meetingClientRef.current = null;
+        setMeetingConnection(null);
+      }
       setActive(false);
       setBusy(false);
       Alert.alert("Could not start", error instanceof Error ? error.message : "Unknown error");
     }
   };
 
-  const primaryLabel = active ? "Stop session" : sessionType === "Upload" ? "Choose audio file" : sessionType === "Live" ? "Start live transcription" : "Start recording";
+  const primaryLabel = active
+    ? sessionType === "Meeting" && !meetingConnection?.is_host ? "Leave meeting" : sessionType === "Meeting" ? "End meeting" : "Stop session"
+    : sessionType === "Upload" ? "Choose audio file" : sessionType === "Live" ? "Start live transcription" : sessionType === "Meeting" ? "Create meeting" : "Start recording";
   const shownDuration = sessionType === "Record" && active ? recorderState.durationMillis / 1000 : duration;
   const displayedSegments = selected?.segments ?? segments;
 
@@ -499,13 +676,17 @@ export default function App() {
             <View style={styles.historyList}>
               {history.length === 0 ? <Text style={styles.emptyCopy}>No transcripts yet. Start your first session.</Text> : history.map((item) => (
                 <Pressable key={item.id} onPress={() => setSelected(item)} style={[styles.historyItem, selected?.id === item.id && styles.historyItemSelected]}>
-                  <View style={styles.historyIcon}><Feather name={item.session_type === "Live" ? "radio" : item.session_type === "Upload" ? "upload-cloud" : "mic"} size={19} color="#B9A7FF" /></View>
-                  <View style={styles.historyBody}><Text numberOfLines={1} style={styles.historyTitle}>{item.title}</Text><Text style={styles.historyMeta}>{item.language} · {new Date(item.created_at).toLocaleDateString()} · {item.status}</Text></View>
+                  <View style={styles.historyIcon}><Feather name={item.session_type === "Meeting" ? "users" : item.session_type === "Live" ? "radio" : item.session_type === "Upload" ? "upload-cloud" : "mic"} size={19} color="#B9A7FF" /></View>
+                  <View style={styles.historyBody}><Text numberOfLines={1} style={styles.historyTitle}>{item.title}</Text><Text style={styles.historyMeta}>{item.language} · {new Date(item.created_at).toLocaleDateString()}</Text></View>
+                  <View style={[styles.historyStatus, item.status === "completed" && styles.historyStatusCompleted, item.status === "failed" && styles.historyStatusFailed]}>
+                    {item.status === "queued" || item.status === "processing" ? <ActivityIndicator color="#9F7AEA" size={10} /> : null}
+                    <Text style={[styles.historyStatusText, item.status === "completed" && styles.historyStatusCompletedText, item.status === "failed" && styles.historyStatusFailedText]}>{recordStatusLabel(item)}</Text>
+                  </View>
                   <Feather name="chevron-right" size={18} color="#625E70" />
                 </Pressable>
               ))}
             </View>
-            <TranscriptPanel segments={displayedSegments} active={false} status={selected?.status ?? "select one"} duration={selected?.duration_seconds ?? 0} audioRecordId={selected?.audio_filename ? selected.id : null} styles={styles} />
+            <TranscriptPanel segments={displayedSegments} active={false} status={selected?.status ?? "select one"} processingStage={selected?.processing_stage} duration={selected?.duration_seconds ?? 0} audioRecordId={selected?.audio_filename ? selected.id : null} styles={styles} />
           </View>
         </ScrollView>
       ) : (
@@ -543,9 +724,53 @@ export default function App() {
                 </View>
               </View>
 
+              {sessionType === "Meeting" ? (
+                <View style={styles.meetingCard}>
+                  <View style={styles.meetingHeader}>
+                    <View><Text style={styles.toggleTitle}>Online meeting</Text><Text style={styles.toggleHint}>Create a room or join from another device</Text></View>
+                    {meetingConnection ? <Text style={styles.roomCode}>{meetingConnection.room_code}</Text> : null}
+                  </View>
+                  {!active ? (
+                    <>
+                      <TextInput
+                        value={meetingName}
+                        onChangeText={setMeetingName}
+                        editable={!busy}
+                        maxLength={80}
+                        placeholder="Your display name"
+                        placeholderTextColor="#716C7B"
+                        style={styles.meetingInput}
+                      />
+                      <View style={styles.meetingJoinRow}>
+                        <TextInput
+                          value={meetingCode}
+                          onChangeText={(value) => setMeetingCode(value.toUpperCase())}
+                          editable={!busy}
+                          autoCapitalize="characters"
+                          maxLength={8}
+                          placeholder="Room code"
+                          placeholderTextColor="#716C7B"
+                          style={[styles.meetingInput, styles.meetingCodeInput]}
+                        />
+                        <Pressable disabled={busy} onPress={() => void startMeeting(true).catch((error) => {
+                          setBusy(false);
+                          Alert.alert("Could not join", error instanceof Error ? error.message : "Meeting failed");
+                        })} style={styles.joinButton}><Text style={styles.joinButtonText}>Join</Text></Pressable>
+                      </View>
+                    </>
+                  ) : (
+                    <View style={styles.participantList}>
+                      {meetingParticipants.map((participant) => (
+                        <View key={participant.identity} style={styles.participantChip}><Feather name="user" size={12} color="#B9A7FF" /><Text style={styles.participantText}>{participant.name}</Text></View>
+                      ))}
+                    </View>
+                  )}
+                </View>
+              ) : null}
+
               <View style={styles.toggleCard}>
                 <View style={styles.toggleIcon}><MaterialCommunityIcons name="account-voice" size={22} color="#B9A7FF" /></View>
-                <View style={styles.toggleText}><Text style={styles.toggleTitle}>Identify speakers</Text><Text style={styles.toggleHint}>Separate and label each voice automatically</Text></View>
+                <View style={styles.toggleText}><Text style={styles.toggleTitle}>{sessionType === "Meeting" ? "Multiple speakers on this device" : "Identify speakers"}</Text><Text style={styles.toggleHint}>{sessionType === "Meeting" ? "Run diarization for this participant's shared microphone" : "Separate and label each voice automatically"}</Text></View>
                 <Switch disabled={active || busy} value={diarization} onValueChange={setDiarization} trackColor={{ false: "#393543", true: "#7C62D8" }} thumbColor="#F7F4FF" />
               </View>
 
@@ -558,7 +783,7 @@ export default function App() {
               <View style={styles.privacyRow}><Feather name="shield" size={13} color="#716C7F" /><Text style={styles.privacyText}>Your audio is encrypted in transit and never used to train public models.</Text></View>
             </View>
 
-            <TranscriptPanel segments={segments} active={active} status={status} duration={shownDuration} intensity={voiceIntensity} audioRecordId={currentRecordId} styles={styles} />
+            <TranscriptPanel segments={segments} active={active} status={status} processingStage={processingStage} duration={shownDuration} intensity={voiceIntensity} audioRecordId={currentRecordId} styles={styles} />
           </View>
         </ScrollView>
       )}
@@ -598,11 +823,13 @@ function createStyles(isDark: boolean) {
     languageGrid: { flexDirection: "row", flexWrap: "wrap", gap: 9 }, languagePill: { minWidth: 105, height: 58, paddingHorizontal: 16, borderRadius: 13, borderWidth: 1, borderColor: c.border, backgroundColor: c.surface, justifyContent: "center" }, languagePillActive: { borderColor: "#8B70DC", backgroundColor: c.selected }, languageNative: { color: c.body, fontFamily: "DMSans_600SemiBold", fontSize: 13 }, languageNativeActive: { color: c.purpleText }, languageEnglish: { color: c.faint, fontFamily: "DMSans_400Regular", fontSize: 9, marginTop: 2 }, checkDot: { position: "absolute", top: 7, right: 7, width: 16, height: 16, borderRadius: 8, backgroundColor: "#B9A7FF", alignItems: "center", justifyContent: "center" },
     sessionGrid: { flexDirection: "row", gap: 10 }, sessionGridStack: { flexDirection: "column" }, sessionCard: { flex: 1, minHeight: 118, padding: 14, borderRadius: 15, borderWidth: 1, borderColor: c.border, backgroundColor: c.surface }, sessionCardActive: { borderColor: "#8067CE", backgroundColor: c.selected }, sessionIcon: { width: 36, height: 36, borderRadius: 10, backgroundColor: c.raised, alignItems: "center", justifyContent: "center", marginBottom: 10 }, sessionIconActive: { backgroundColor: "#755BD0" }, sessionLabel: { color: c.body, fontFamily: "DMSans_600SemiBold", fontSize: 13 }, sessionLabelActive: { color: c.purpleText }, sessionHint: { color: c.faint, fontFamily: "DMSans_400Regular", fontSize: 9.5, marginTop: 3 },
     toggleCard: { minHeight: 74, padding: 14, borderRadius: 15, borderWidth: 1, borderColor: c.border, backgroundColor: c.surface, flexDirection: "row", alignItems: "center" }, toggleIcon: { width: 40, height: 40, borderRadius: 12, backgroundColor: c.purpleSurface, alignItems: "center", justifyContent: "center", marginRight: 12 }, toggleText: { flex: 1 }, toggleTitle: { color: c.softText, fontFamily: "DMSans_600SemiBold", fontSize: 13 }, toggleHint: { color: c.faint, fontFamily: "DMSans_400Regular", fontSize: 10, marginTop: 3 },
+    meetingCard: { gap: 11, padding: 14, borderRadius: 15, borderWidth: 1, borderColor: c.border, backgroundColor: c.surface }, meetingHeader: { flexDirection: "row", alignItems: "center", justifyContent: "space-between" }, roomCode: { color: c.purpleText, fontFamily: "DMSans_700Bold", fontSize: 15, letterSpacing: 1.5 }, meetingInput: { height: 44, borderRadius: 11, borderWidth: 1, borderColor: c.border, backgroundColor: c.raised, color: c.text, paddingHorizontal: 13, fontFamily: "DMSans_500Medium", fontSize: 12 }, meetingJoinRow: { flexDirection: "row", gap: 9 }, meetingCodeInput: { flex: 1, letterSpacing: 1.3 }, joinButton: { width: 86, borderRadius: 11, backgroundColor: c.purpleSurface, borderWidth: 1, borderColor: c.strongBorder, alignItems: "center", justifyContent: "center" }, joinButtonText: { color: c.purpleText, fontFamily: "DMSans_700Bold", fontSize: 11 }, participantList: { flexDirection: "row", flexWrap: "wrap", gap: 8 }, participantChip: { flexDirection: "row", alignItems: "center", gap: 6, paddingHorizontal: 9, height: 30, borderRadius: 15, backgroundColor: c.raised }, participantText: { color: c.body, fontFamily: "DMSans_500Medium", fontSize: 10 },
     primaryWrap: { borderRadius: 14, overflow: "hidden", marginTop: -4 }, primaryButton: { height: 55, flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 10 }, primaryText: { color: "white", fontFamily: "DMSans_600SemiBold", fontSize: 14 }, privacyRow: { flexDirection: "row", justifyContent: "center", alignItems: "center", gap: 6, marginTop: -13 }, privacyText: { color: c.faint, fontFamily: "DMSans_400Regular", fontSize: 8.5, textAlign: "center" },
     transcriptCard: { flex: 1, minHeight: 535, borderRadius: 20, borderWidth: 1, borderColor: c.border, backgroundColor: c.panel, overflow: "hidden" }, transcriptHeader: { height: 88, paddingHorizontal: 22, flexDirection: "row", alignItems: "center", justifyContent: "space-between", borderBottomWidth: 1, borderBottomColor: c.border }, panelEyebrow: { color: c.faint, fontFamily: "DMSans_700Bold", fontSize: 8, letterSpacing: 1.7 }, panelTitle: { color: c.softText, fontFamily: "DMSans_600SemiBold", fontSize: 15, marginTop: 5 }, liveBadge: { paddingHorizontal: 10, height: 25, borderRadius: 12.5, backgroundColor: "rgba(229,72,103,0.13)", flexDirection: "row", alignItems: "center", gap: 6 }, idleBadge: { backgroundColor: c.raised }, liveDot: { width: 6, height: 6, borderRadius: 3, backgroundColor: "#F15E78" }, idleDot: { backgroundColor: c.muted }, liveText: { color: "#E0526D", fontFamily: "DMSans_700Bold", fontSize: 8, letterSpacing: 1 }, idleText: { color: c.muted },
     waveform: { height: 91, paddingHorizontal: 22, flexDirection: "row", alignItems: "center", justifyContent: "space-between" }, waveBar: { width: 3, borderRadius: 3, backgroundColor: "#8E6EE0" }, timelineRow: { flexDirection: "row", alignItems: "center", gap: 10, paddingHorizontal: 22, paddingBottom: 18 }, timeText: { color: c.faint, fontFamily: "DMSans_500Medium", fontSize: 8 }, timeline: { flex: 1, height: 1, backgroundColor: c.border }, transcriptScroll: { flex: 1, borderTopWidth: 1, borderTopColor: c.border }, transcriptContent: { flexGrow: 1, padding: 22 }, emptyTranscript: { flex: 1, minHeight: 230, alignItems: "center", justifyContent: "center", paddingHorizontal: 32 }, emptyIcon: { width: 55, height: 55, borderRadius: 27.5, backgroundColor: c.raised, alignItems: "center", justifyContent: "center", marginBottom: 14 }, emptyTitle: { color: c.body, fontFamily: "DMSans_600SemiBold", fontSize: 13 }, emptyCopy: { color: c.faint, fontFamily: "DMSans_400Regular", fontSize: 10.5, lineHeight: 16, textAlign: "center", marginTop: 6 }, segmentRow: { flexDirection: "row", marginBottom: 19 }, segmentTime: { width: 42, color: c.faint, fontFamily: "DMSans_500Medium", fontSize: 9, paddingTop: 2 }, speakerLine: { width: 2, borderRadius: 2, marginRight: 12 }, segmentBody: { flex: 1 }, segmentMeta: { flexDirection: "row", alignItems: "center", gap: 7, marginBottom: 4 }, speakerName: { fontFamily: "DMSans_700Bold", fontSize: 9, textTransform: "uppercase", letterSpacing: 0.7 }, languageTag: { color: c.faint, backgroundColor: c.raised, borderRadius: 7, overflow: "hidden", paddingHorizontal: 6, paddingVertical: 2, fontFamily: "DMSans_600SemiBold", fontSize: 7.5, textTransform: "uppercase", letterSpacing: 0.5 }, segmentText: { color: c.body, fontFamily: "DMSans_400Regular", fontSize: 12.5, lineHeight: 19 },
     audioPlayer: { marginHorizontal: 22, marginBottom: 16, flexDirection: "row", alignItems: "center", gap: 10 }, audioPlayButton: { width: 32, height: 32, borderRadius: 16, backgroundColor: "#755BD0", alignItems: "center", justifyContent: "center" }, audioProgressTrack: { flex: 1, height: 4, borderRadius: 2, backgroundColor: c.raised, overflow: "hidden" }, audioProgressFill: { height: "100%", borderRadius: 2, backgroundColor: "#9F7AEA" }, audioTime: { minWidth: 72, color: c.faint, fontFamily: "DMSans_500Medium", fontSize: 8, textAlign: "right" },
-    historyPage: { paddingHorizontal: 22, paddingTop: 48, paddingBottom: 110 }, historyLayout: { width: "100%", maxWidth: 1180, alignSelf: "center", gap: 22 }, historyLayoutWide: { flexDirection: "row" }, historyList: { flex: 0.85, gap: 9 }, historyItem: { minHeight: 75, borderRadius: 14, borderWidth: 1, borderColor: c.border, backgroundColor: c.surface, paddingHorizontal: 14, flexDirection: "row", alignItems: "center" }, historyItemSelected: { borderColor: "#745FC0", backgroundColor: c.selected }, historyIcon: { width: 40, height: 40, borderRadius: 11, backgroundColor: c.purpleSurface, alignItems: "center", justifyContent: "center", marginRight: 12 }, historyBody: { flex: 1 }, historyTitle: { color: c.softText, fontFamily: "DMSans_600SemiBold", fontSize: 12.5 }, historyMeta: { color: c.faint, fontFamily: "DMSans_400Regular", fontSize: 9.5, marginTop: 4 },
+    processingCard: { marginHorizontal: 22, marginBottom: 16, padding: 14, borderRadius: 13, borderWidth: 1, borderColor: c.strongBorder, backgroundColor: c.purpleSurface, flexDirection: "row", alignItems: "center", gap: 12 }, processingBody: { flex: 1 }, processingTitle: { color: c.purpleText, fontFamily: "DMSans_700Bold", fontSize: 11 }, processingCopy: { color: c.muted, fontFamily: "DMSans_400Regular", fontSize: 9.5, lineHeight: 14, marginTop: 3 },
+    historyPage: { paddingHorizontal: 22, paddingTop: 48, paddingBottom: 110 }, historyLayout: { width: "100%", maxWidth: 1180, alignSelf: "center", gap: 22 }, historyLayoutWide: { flexDirection: "row" }, historyList: { flex: 0.85, gap: 9 }, historyItem: { minHeight: 75, borderRadius: 14, borderWidth: 1, borderColor: c.border, backgroundColor: c.surface, paddingHorizontal: 14, flexDirection: "row", alignItems: "center" }, historyItemSelected: { borderColor: "#745FC0", backgroundColor: c.selected }, historyIcon: { width: 40, height: 40, borderRadius: 11, backgroundColor: c.purpleSurface, alignItems: "center", justifyContent: "center", marginRight: 12 }, historyBody: { flex: 1 }, historyTitle: { color: c.softText, fontFamily: "DMSans_600SemiBold", fontSize: 12.5 }, historyMeta: { color: c.faint, fontFamily: "DMSans_400Regular", fontSize: 9.5, marginTop: 4 }, historyStatus: { maxWidth: 128, minHeight: 25, paddingHorizontal: 8, borderRadius: 12.5, backgroundColor: c.purpleSurface, flexDirection: "row", alignItems: "center", gap: 5, marginLeft: 8 }, historyStatusCompleted: { backgroundColor: "rgba(52,211,153,0.12)" }, historyStatusFailed: { backgroundColor: "rgba(239,92,117,0.12)" }, historyStatusText: { color: c.purpleText, fontFamily: "DMSans_700Bold", fontSize: 7.5, textTransform: "uppercase" }, historyStatusCompletedText: { color: "#34B981" }, historyStatusFailedText: { color: "#E0526D" },
     mobileNav: { position: "absolute", bottom: 0, left: 0, right: 0, height: Platform.OS === "ios" ? 82 : 68, paddingBottom: Platform.OS === "ios" ? 15 : 3, borderTopWidth: 1, borderTopColor: c.border, backgroundColor: c.header, flexDirection: "row", justifyContent: "space-around", alignItems: "center" }, mobileNavItem: { width: 90, alignItems: "center", gap: 2 }, mobileNavText: { color: c.faint, fontFamily: "DMSans_500Medium", fontSize: 9 }, mobileNavTextActive: { color: c.purpleText },
   });
 }
