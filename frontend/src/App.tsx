@@ -14,6 +14,7 @@ import {
   View,
   useColorScheme,
   useWindowDimensions,
+  type GestureResponderEvent,
 } from "react-native";
 import { StatusBar } from "expo-status-bar";
 import { LinearGradient } from "expo-linear-gradient";
@@ -37,7 +38,7 @@ import {
   useFonts,
 } from "@expo-google-fonts/dm-sans";
 
-import { createMeeting, endMeeting, getAudioUrl, getHistory, getTranscript, joinMeeting, submitAudio, WS_URL } from "./api";
+import { createMeeting, deleteTranscript, endMeeting, getAudioUrl, getHistory, getTranscript, joinMeeting, submitAudio, WS_URL } from "./api";
 import type { Language, MeetingConnection, ProcessingStage, Segment, SessionType, TranscriptRecord } from "./types";
 import type { MeetingClient, MeetingParticipantView } from "./livekitMeeting";
 import { startWebAudioStream, type WebAudioStream } from "./webAudioStream";
@@ -115,21 +116,42 @@ function SectionTitle({ number, title, styles }: { number: string; title: string
 }
 
 function AnimatedWaveform({ active, intensity, styles }: { active: boolean; intensity: number; styles: AppStyles }) {
-  const levels = useRef(waveform.map(() => new Animated.Value(0))).current;
+  const levels = useRef(waveform.map(() => new Animated.Value(0.08))).current;
+  const audioState = useRef({ active, intensity });
 
   useEffect(() => {
-    const target = active ? Math.max(0.03, Math.min(1, intensity)) : 0;
-    const animation = Animated.parallel(levels.map((level, index) =>
-      Animated.timing(level, {
-        toValue: Math.min(1, target * (0.65 + (waveform[index]! / 73) * 0.55)),
-        duration: 90,
-        easing: Easing.out(Easing.quad),
-        useNativeDriver: false,
-      }),
-    ));
-    animation.start();
-    return () => animation.stop();
-  }, [active, intensity, levels]);
+    audioState.current = { active, intensity };
+  }, [active, intensity]);
+
+  useEffect(() => {
+    let phase = 0;
+    let animation: Animated.CompositeAnimation | null = null;
+    const animate = () => {
+      phase += 0.48;
+      const state = audioState.current;
+      const energy = state.active ? Math.max(0.18, Math.min(1, state.intensity)) : 0;
+      animation = Animated.parallel(levels.map((level, index) => {
+        const motion = 0.45 + 0.55 * Math.abs(Math.sin(phase + index * 0.58));
+        const profile = 0.55 + (waveform[index]! / 73) * 0.45;
+        const target = state.active
+          ? Math.min(1, 0.12 + energy * motion * profile)
+          : 0.06 + motion * profile * 0.1;
+        return Animated.timing(level, {
+          toValue: target,
+          duration: state.active ? 135 : 360,
+          easing: Easing.inOut(Easing.sin),
+          useNativeDriver: false,
+        });
+      }));
+      animation.start();
+    };
+    animate();
+    const timer = setInterval(animate, active ? 145 : 380);
+    return () => {
+      clearInterval(timer);
+      animation?.stop();
+    };
+  }, [active, levels]);
 
   return (
     <View style={styles.waveform} accessibilityLabel={active ? "Audio waveform active" : "Audio waveform idle"}>
@@ -153,6 +175,8 @@ function AudioPlayback({ recordId, styles }: { recordId: string; styles: AppStyl
   const player = useAudioPlayer(getAudioUrl(recordId), { updateInterval: 250 });
   const playback = useAudioPlayerStatus(player);
   const total = playback.duration || 0;
+  const [trackWidth, setTrackWidth] = useState(0);
+  const progress = total > 0 ? Math.max(0, Math.min(1, playback.currentTime / total)) : 0;
 
   const toggle = async () => {
     if (playback.playing) {
@@ -166,13 +190,31 @@ function AudioPlayback({ recordId, styles }: { recordId: string; styles: AppStyl
     player.play();
   };
 
+  const seek = (event: GestureResponderEvent) => {
+    if (total <= 0 || trackWidth <= 0) return;
+    const fraction = Math.max(0, Math.min(1, event.nativeEvent.locationX / trackWidth));
+    void player.seekTo(fraction * total);
+  };
+
   return (
     <View style={styles.audioPlayer}>
       <Pressable accessibilityRole="button" accessibilityLabel={playback.playing ? "Pause recording" : "Play recording"} onPress={() => void toggle()} style={styles.audioPlayButton}>
         <Feather name={playback.playing ? "pause" : "play"} size={15} color="white" />
       </Pressable>
-      <View style={styles.audioProgressTrack}>
-        <View style={[styles.audioProgressFill, { width: `${total > 0 ? Math.min(100, (playback.currentTime / total) * 100) : 0}%` }]} />
+      <View
+        accessibilityRole="adjustable"
+        accessibilityLabel="Recording position"
+        onLayout={(event) => setTrackWidth(event.nativeEvent.layout.width)}
+        onStartShouldSetResponder={() => total > 0}
+        onMoveShouldSetResponder={() => total > 0}
+        onResponderGrant={seek}
+        onResponderMove={seek}
+        style={styles.audioProgressTouch}
+      >
+        <View style={styles.audioProgressTrack}>
+          <View style={[styles.audioProgressFill, { width: `${progress * 100}%` }]} />
+          <View style={[styles.audioProgressThumb, { left: `${progress * 100}%` }]} />
+        </View>
       </View>
       <Text style={styles.audioTime}>{formatTime(playback.currentTime)} / {formatTime(total)}</Text>
     </View>
@@ -289,6 +331,7 @@ export default function App() {
   const [segments, setSegments] = useState<Segment[]>([]);
   const [history, setHistory] = useState<TranscriptRecord[]>([]);
   const [selected, setSelected] = useState<TranscriptRecord | null>(null);
+  const [deletingRecordId, setDeletingRecordId] = useState<string | null>(null);
   const [trackedJobIds, setTrackedJobIds] = useState<string[]>([]);
   const [currentRecordId, setCurrentRecordId] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -299,6 +342,7 @@ export default function App() {
   const socketRef = useRef<WebSocket | null>(null);
   const webAudioRef = useRef<WebAudioStream | null>(null);
   const meetingClientRef = useRef<MeetingClient | null>(null);
+  const historyScrollRef = useRef<ScrollView>(null);
   const recorder = useAudioRecorder({ ...RecordingPresets.HIGH_QUALITY, isMeteringEnabled: true });
   const recorderState = useAudioRecorderState(recorder, 250);
 
@@ -361,7 +405,42 @@ export default function App() {
     setTrackedJobIds((current) => current.includes(id) ? current : [...current, id]);
   }, []);
 
+  const confirmDelete = (record: TranscriptRecord) => {
+    Alert.alert(
+      "Delete transcript?",
+      `“${record.title}” and its saved audio will be permanently removed.`,
+      [
+        { text: "Cancel", style: "cancel" },
+        {
+          text: "Delete",
+          style: "destructive",
+          onPress: () => {
+            setDeletingRecordId(record.id);
+            void deleteTranscript(record.id)
+              .then(() => {
+                setHistory((current) => current.filter((item) => item.id !== record.id));
+                setSelected((current) => current?.id === record.id ? null : current);
+                setTrackedJobIds((current) => current.filter((id) => id !== record.id));
+                if (currentRecordId === record.id) {
+                  setCurrentRecordId(null);
+                  setSegments([]);
+                }
+              })
+              .catch((error) => Alert.alert("Delete failed", error instanceof Error ? error.message : "Could not delete transcript"))
+              .finally(() => setDeletingRecordId(null));
+          },
+        },
+      ],
+    );
+  };
+
   useEffect(() => { void refreshHistory(); }, [refreshHistory]);
+
+  useEffect(() => {
+    if (tab !== "history") return;
+    const timer = setTimeout(() => historyScrollRef.current?.scrollTo({ y: 0, animated: false }), 50);
+    return () => clearTimeout(timer);
+  }, [selected?.id, tab]);
 
   useEffect(() => {
     if (trackedJobIds.length === 0) return;
@@ -635,7 +714,7 @@ export default function App() {
     ? sessionType === "Meeting" && !meetingConnection?.is_host ? "Leave meeting" : sessionType === "Meeting" ? "End meeting" : "Stop session"
     : sessionType === "Upload" ? "Choose audio file" : sessionType === "Live" ? "Start live transcription" : sessionType === "Meeting" ? "Create meeting" : "Start recording";
   const shownDuration = sessionType === "Record" && active ? recorderState.durationMillis / 1000 : duration;
-  const displayedSegments = selected?.segments ?? segments;
+  const displayedSegments = selected?.segments ?? [];
 
   if (!fontsLoaded) return <View style={styles.loading}><ActivityIndicator color="#9F7AEA" /></View>;
 
@@ -670,27 +749,56 @@ export default function App() {
       </View>
 
       {tab === "history" ? (
-        <ScrollView contentContainerStyle={styles.historyPage}>
-          <View style={styles.pageIntro}><Text style={styles.eyebrow}>YOUR LIBRARY</Text><Text style={styles.heroTitle}>Transcript history</Text><Text style={styles.heroCopy}>Every conversation, ready when you need it.</Text></View>
-          <View style={[styles.historyLayout, isWide && styles.historyLayoutWide]}>
-            <View style={styles.historyList}>
-              {history.length === 0 ? <Text style={styles.emptyCopy}>No transcripts yet. Start your first session.</Text> : history.map((item) => (
-                <Pressable key={item.id} onPress={() => setSelected(item)} style={[styles.historyItem, selected?.id === item.id && styles.historyItemSelected]}>
-                  <View style={styles.historyIcon}><Feather name={item.session_type === "Meeting" ? "users" : item.session_type === "Live" ? "radio" : item.session_type === "Upload" ? "upload-cloud" : "mic"} size={19} color="#B9A7FF" /></View>
-                  <View style={styles.historyBody}><Text numberOfLines={1} style={styles.historyTitle}>{item.title}</Text><Text style={styles.historyMeta}>{item.language} · {new Date(item.created_at).toLocaleDateString()}</Text></View>
-                  <View style={[styles.historyStatus, item.status === "completed" && styles.historyStatusCompleted, item.status === "failed" && styles.historyStatusFailed]}>
-                    {item.status === "queued" || item.status === "processing" ? <ActivityIndicator color="#9F7AEA" size={10} /> : null}
-                    <Text style={[styles.historyStatusText, item.status === "completed" && styles.historyStatusCompletedText, item.status === "failed" && styles.historyStatusFailedText]}>{recordStatusLabel(item)}</Text>
-                  </View>
-                  <Feather name="chevron-right" size={18} color="#625E70" />
+        <ScrollView key="history" ref={historyScrollRef} onContentSizeChange={() => historyScrollRef.current?.scrollTo({ y: 0, animated: false })} contentContainerStyle={styles.historyPage}>
+          {isWide || !selected ? <View style={styles.pageIntro}><Text style={styles.eyebrow}>YOUR LIBRARY</Text><Text style={styles.heroTitle}>Transcript history</Text><Text style={styles.heroCopy}>Every conversation, ready when you need it.</Text></View> : null}
+          {!isWide && selected ? (
+            <View style={styles.historyDetail}>
+              <View style={styles.historyDetailActions}>
+                <Pressable accessibilityRole="button" accessibilityLabel="Back to transcript history" onPress={() => setSelected(null)} style={styles.historyBackButton}>
+                  <Feather name="arrow-left" size={17} color="#B9A7FF" />
+                  <Text style={styles.historyBackText}>Back to history</Text>
                 </Pressable>
-              ))}
+                {selected.status === "completed" || selected.status === "failed" ? (
+                  <Pressable accessibilityRole="button" accessibilityLabel="Delete transcript" disabled={deletingRecordId === selected.id} onPress={() => confirmDelete(selected)} style={styles.historyDeleteButton}>
+                    {deletingRecordId === selected.id ? <ActivityIndicator color="#EF6A7F" size={15} /> : <Feather name="trash-2" size={16} color="#EF6A7F" />}
+                  </Pressable>
+                ) : null}
+              </View>
+              <Text numberOfLines={2} style={styles.historyDetailTitle}>{selected.title}</Text>
+              <TranscriptPanel segments={displayedSegments} active={false} status={selected.status} processingStage={selected.processing_stage} duration={selected.duration_seconds ?? 0} audioRecordId={selected.audio_filename ? selected.id : null} styles={styles} />
             </View>
-            <TranscriptPanel segments={displayedSegments} active={false} status={selected?.status ?? "select one"} processingStage={selected?.processing_stage} duration={selected?.duration_seconds ?? 0} audioRecordId={selected?.audio_filename ? selected.id : null} styles={styles} />
-          </View>
+          ) : (
+            <View style={[styles.historyLayout, isWide && styles.historyLayoutWide]}>
+              <View style={styles.historyList}>
+                {history.length === 0 ? <Text style={styles.emptyCopy}>No transcripts yet. Start your first session.</Text> : history.map((item) => (
+                  <Pressable key={item.id} onPress={() => setSelected(item)} style={[styles.historyItem, selected?.id === item.id && styles.historyItemSelected]}>
+                    <View style={styles.historyIcon}><Feather name={item.session_type === "Meeting" ? "users" : item.session_type === "Live" ? "radio" : item.session_type === "Upload" ? "upload-cloud" : "mic"} size={19} color="#B9A7FF" /></View>
+                    <View style={styles.historyBody}><Text numberOfLines={1} style={styles.historyTitle}>{item.title}</Text><Text style={styles.historyMeta}>{item.language} · {new Date(item.created_at).toLocaleDateString()}</Text></View>
+                    <View style={[styles.historyStatus, item.status === "completed" && styles.historyStatusCompleted, item.status === "failed" && styles.historyStatusFailed]}>
+                      {item.status === "queued" || item.status === "processing" ? <ActivityIndicator color="#9F7AEA" size={10} /> : null}
+                      <Text style={[styles.historyStatusText, item.status === "completed" && styles.historyStatusCompletedText, item.status === "failed" && styles.historyStatusFailedText]}>{recordStatusLabel(item)}</Text>
+                    </View>
+                    {item.status === "completed" || item.status === "failed" ? (
+                      <Pressable
+                        accessibilityRole="button"
+                        accessibilityLabel={`Delete ${item.title}`}
+                        disabled={deletingRecordId === item.id}
+                        onPress={(event) => { event.stopPropagation(); confirmDelete(item); }}
+                        hitSlop={8}
+                        style={styles.historyRowDelete}
+                      >
+                        {deletingRecordId === item.id ? <ActivityIndicator color="#EF6A7F" size={14} /> : <Feather name="trash-2" size={15} color="#9A7180" />}
+                      </Pressable>
+                    ) : <Feather name="chevron-right" size={18} color="#625E70" />}
+                  </Pressable>
+                ))}
+              </View>
+              {isWide ? <TranscriptPanel segments={displayedSegments} active={false} status={selected?.status ?? "select one"} processingStage={selected?.processing_stage} duration={selected?.duration_seconds ?? 0} audioRecordId={selected?.audio_filename ? selected.id : null} styles={styles} /> : null}
+            </View>
+          )}
         </ScrollView>
       ) : (
-        <ScrollView contentContainerStyle={styles.mainScroll} keyboardShouldPersistTaps="handled">
+        <ScrollView key="new" contentContainerStyle={styles.mainScroll} keyboardShouldPersistTaps="handled">
           <View style={styles.pageIntro}>
             <Text style={styles.eyebrow}>NEW TRANSCRIPTION</Text>
             <Text style={styles.heroTitle}>Turn every voice into words.</Text>
@@ -826,10 +934,10 @@ function createStyles(isDark: boolean) {
     meetingCard: { gap: 11, padding: 14, borderRadius: 15, borderWidth: 1, borderColor: c.border, backgroundColor: c.surface }, meetingHeader: { flexDirection: "row", alignItems: "center", justifyContent: "space-between" }, roomCode: { color: c.purpleText, fontFamily: "DMSans_700Bold", fontSize: 15, letterSpacing: 1.5 }, meetingInput: { height: 44, borderRadius: 11, borderWidth: 1, borderColor: c.border, backgroundColor: c.raised, color: c.text, paddingHorizontal: 13, fontFamily: "DMSans_500Medium", fontSize: 12 }, meetingJoinRow: { flexDirection: "row", gap: 9 }, meetingCodeInput: { flex: 1, letterSpacing: 1.3 }, joinButton: { width: 86, borderRadius: 11, backgroundColor: c.purpleSurface, borderWidth: 1, borderColor: c.strongBorder, alignItems: "center", justifyContent: "center" }, joinButtonText: { color: c.purpleText, fontFamily: "DMSans_700Bold", fontSize: 11 }, participantList: { flexDirection: "row", flexWrap: "wrap", gap: 8 }, participantChip: { flexDirection: "row", alignItems: "center", gap: 6, paddingHorizontal: 9, height: 30, borderRadius: 15, backgroundColor: c.raised }, participantText: { color: c.body, fontFamily: "DMSans_500Medium", fontSize: 10 },
     primaryWrap: { borderRadius: 14, overflow: "hidden", marginTop: -4 }, primaryButton: { height: 55, flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 10 }, primaryText: { color: "white", fontFamily: "DMSans_600SemiBold", fontSize: 14 }, privacyRow: { flexDirection: "row", justifyContent: "center", alignItems: "center", gap: 6, marginTop: -13 }, privacyText: { color: c.faint, fontFamily: "DMSans_400Regular", fontSize: 8.5, textAlign: "center" },
     transcriptCard: { flex: 1, minHeight: 535, borderRadius: 20, borderWidth: 1, borderColor: c.border, backgroundColor: c.panel, overflow: "hidden" }, transcriptHeader: { height: 88, paddingHorizontal: 22, flexDirection: "row", alignItems: "center", justifyContent: "space-between", borderBottomWidth: 1, borderBottomColor: c.border }, panelEyebrow: { color: c.faint, fontFamily: "DMSans_700Bold", fontSize: 8, letterSpacing: 1.7 }, panelTitle: { color: c.softText, fontFamily: "DMSans_600SemiBold", fontSize: 15, marginTop: 5 }, liveBadge: { paddingHorizontal: 10, height: 25, borderRadius: 12.5, backgroundColor: "rgba(229,72,103,0.13)", flexDirection: "row", alignItems: "center", gap: 6 }, idleBadge: { backgroundColor: c.raised }, liveDot: { width: 6, height: 6, borderRadius: 3, backgroundColor: "#F15E78" }, idleDot: { backgroundColor: c.muted }, liveText: { color: "#E0526D", fontFamily: "DMSans_700Bold", fontSize: 8, letterSpacing: 1 }, idleText: { color: c.muted },
-    waveform: { height: 91, paddingHorizontal: 22, flexDirection: "row", alignItems: "center", justifyContent: "space-between" }, waveBar: { width: 3, borderRadius: 3, backgroundColor: "#8E6EE0" }, timelineRow: { flexDirection: "row", alignItems: "center", gap: 10, paddingHorizontal: 22, paddingBottom: 18 }, timeText: { color: c.faint, fontFamily: "DMSans_500Medium", fontSize: 8 }, timeline: { flex: 1, height: 1, backgroundColor: c.border }, transcriptScroll: { flex: 1, borderTopWidth: 1, borderTopColor: c.border }, transcriptContent: { flexGrow: 1, padding: 22 }, emptyTranscript: { flex: 1, minHeight: 230, alignItems: "center", justifyContent: "center", paddingHorizontal: 32 }, emptyIcon: { width: 55, height: 55, borderRadius: 27.5, backgroundColor: c.raised, alignItems: "center", justifyContent: "center", marginBottom: 14 }, emptyTitle: { color: c.body, fontFamily: "DMSans_600SemiBold", fontSize: 13 }, emptyCopy: { color: c.faint, fontFamily: "DMSans_400Regular", fontSize: 10.5, lineHeight: 16, textAlign: "center", marginTop: 6 }, segmentRow: { flexDirection: "row", marginBottom: 19 }, segmentTime: { width: 42, color: c.faint, fontFamily: "DMSans_500Medium", fontSize: 9, paddingTop: 2 }, speakerLine: { width: 2, borderRadius: 2, marginRight: 12 }, segmentBody: { flex: 1 }, segmentMeta: { flexDirection: "row", alignItems: "center", gap: 7, marginBottom: 4 }, speakerName: { fontFamily: "DMSans_700Bold", fontSize: 9, textTransform: "uppercase", letterSpacing: 0.7 }, languageTag: { color: c.faint, backgroundColor: c.raised, borderRadius: 7, overflow: "hidden", paddingHorizontal: 6, paddingVertical: 2, fontFamily: "DMSans_600SemiBold", fontSize: 7.5, textTransform: "uppercase", letterSpacing: 0.5 }, segmentText: { color: c.body, fontFamily: "DMSans_400Regular", fontSize: 12.5, lineHeight: 19 },
-    audioPlayer: { marginHorizontal: 22, marginBottom: 16, flexDirection: "row", alignItems: "center", gap: 10 }, audioPlayButton: { width: 32, height: 32, borderRadius: 16, backgroundColor: "#755BD0", alignItems: "center", justifyContent: "center" }, audioProgressTrack: { flex: 1, height: 4, borderRadius: 2, backgroundColor: c.raised, overflow: "hidden" }, audioProgressFill: { height: "100%", borderRadius: 2, backgroundColor: "#9F7AEA" }, audioTime: { minWidth: 72, color: c.faint, fontFamily: "DMSans_500Medium", fontSize: 8, textAlign: "right" },
+    waveform: { height: 78, marginHorizontal: 22, marginTop: 14, paddingHorizontal: 16, borderRadius: 16, borderWidth: 1, borderColor: c.border, backgroundColor: c.raised, flexDirection: "row", alignItems: "center", justifyContent: "space-between" }, waveBar: { width: 3, borderRadius: 3, backgroundColor: "#9F7AEA" }, timelineRow: { flexDirection: "row", alignItems: "center", gap: 10, paddingHorizontal: 22, paddingTop: 10, paddingBottom: 14 }, timeText: { color: c.faint, fontFamily: "DMSans_500Medium", fontSize: 8 }, timeline: { flex: 1, height: 1, backgroundColor: c.border }, transcriptScroll: { flex: 1, borderTopWidth: 1, borderTopColor: c.border }, transcriptContent: { flexGrow: 1, padding: 22 }, emptyTranscript: { flex: 1, minHeight: 230, alignItems: "center", justifyContent: "center", paddingHorizontal: 32 }, emptyIcon: { width: 55, height: 55, borderRadius: 27.5, backgroundColor: c.raised, alignItems: "center", justifyContent: "center", marginBottom: 14 }, emptyTitle: { color: c.body, fontFamily: "DMSans_600SemiBold", fontSize: 13 }, emptyCopy: { color: c.faint, fontFamily: "DMSans_400Regular", fontSize: 10.5, lineHeight: 16, textAlign: "center", marginTop: 6 }, segmentRow: { flexDirection: "row", marginBottom: 19 }, segmentTime: { width: 42, color: c.faint, fontFamily: "DMSans_500Medium", fontSize: 9, paddingTop: 2 }, speakerLine: { width: 2, borderRadius: 2, marginRight: 12 }, segmentBody: { flex: 1 }, segmentMeta: { flexDirection: "row", alignItems: "center", gap: 7, marginBottom: 4 }, speakerName: { fontFamily: "DMSans_700Bold", fontSize: 9, textTransform: "uppercase", letterSpacing: 0.7 }, languageTag: { color: c.faint, backgroundColor: c.raised, borderRadius: 7, overflow: "hidden", paddingHorizontal: 6, paddingVertical: 2, fontFamily: "DMSans_600SemiBold", fontSize: 7.5, textTransform: "uppercase", letterSpacing: 0.5 }, segmentText: { color: c.body, fontFamily: "DMSans_400Regular", fontSize: 12.5, lineHeight: 19 },
+    audioPlayer: { marginHorizontal: 22, marginBottom: 16, flexDirection: "row", alignItems: "center", gap: 10 }, audioPlayButton: { width: 34, height: 34, borderRadius: 17, backgroundColor: "#755BD0", alignItems: "center", justifyContent: "center" }, audioProgressTouch: { flex: 1, height: 30, justifyContent: "center" }, audioProgressTrack: { width: "100%", height: 5, borderRadius: 3, backgroundColor: c.raised }, audioProgressFill: { height: "100%", borderRadius: 3, backgroundColor: "#9F7AEA" }, audioProgressThumb: { position: "absolute", top: -4, width: 13, height: 13, marginLeft: -6.5, borderRadius: 7, borderWidth: 2, borderColor: c.panel, backgroundColor: "#B9A7FF" }, audioTime: { minWidth: 72, color: c.faint, fontFamily: "DMSans_500Medium", fontSize: 8, textAlign: "right" },
     processingCard: { marginHorizontal: 22, marginBottom: 16, padding: 14, borderRadius: 13, borderWidth: 1, borderColor: c.strongBorder, backgroundColor: c.purpleSurface, flexDirection: "row", alignItems: "center", gap: 12 }, processingBody: { flex: 1 }, processingTitle: { color: c.purpleText, fontFamily: "DMSans_700Bold", fontSize: 11 }, processingCopy: { color: c.muted, fontFamily: "DMSans_400Regular", fontSize: 9.5, lineHeight: 14, marginTop: 3 },
-    historyPage: { paddingHorizontal: 22, paddingTop: 48, paddingBottom: 110 }, historyLayout: { width: "100%", maxWidth: 1180, alignSelf: "center", gap: 22 }, historyLayoutWide: { flexDirection: "row" }, historyList: { flex: 0.85, gap: 9 }, historyItem: { minHeight: 75, borderRadius: 14, borderWidth: 1, borderColor: c.border, backgroundColor: c.surface, paddingHorizontal: 14, flexDirection: "row", alignItems: "center" }, historyItemSelected: { borderColor: "#745FC0", backgroundColor: c.selected }, historyIcon: { width: 40, height: 40, borderRadius: 11, backgroundColor: c.purpleSurface, alignItems: "center", justifyContent: "center", marginRight: 12 }, historyBody: { flex: 1 }, historyTitle: { color: c.softText, fontFamily: "DMSans_600SemiBold", fontSize: 12.5 }, historyMeta: { color: c.faint, fontFamily: "DMSans_400Regular", fontSize: 9.5, marginTop: 4 }, historyStatus: { maxWidth: 128, minHeight: 25, paddingHorizontal: 8, borderRadius: 12.5, backgroundColor: c.purpleSurface, flexDirection: "row", alignItems: "center", gap: 5, marginLeft: 8 }, historyStatusCompleted: { backgroundColor: "rgba(52,211,153,0.12)" }, historyStatusFailed: { backgroundColor: "rgba(239,92,117,0.12)" }, historyStatusText: { color: c.purpleText, fontFamily: "DMSans_700Bold", fontSize: 7.5, textTransform: "uppercase" }, historyStatusCompletedText: { color: "#34B981" }, historyStatusFailedText: { color: "#E0526D" },
+    historyPage: { paddingHorizontal: 22, paddingTop: 48, paddingBottom: 110 }, historyLayout: { width: "100%", maxWidth: 1180, alignSelf: "center", gap: 22 }, historyLayoutWide: { flexDirection: "row" }, historyList: { flex: 0.85, gap: 9 }, historyDetail: { width: "100%", maxWidth: 760, alignSelf: "center" }, historyDetailActions: { minHeight: 44, flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }, historyBackButton: { minHeight: 40, flexDirection: "row", alignItems: "center", gap: 8 }, historyBackText: { color: c.purpleText, fontFamily: "DMSans_600SemiBold", fontSize: 12 }, historyDeleteButton: { width: 38, height: 38, borderRadius: 11, borderWidth: 1, borderColor: "rgba(239,106,127,0.25)", backgroundColor: "rgba(239,106,127,0.08)", alignItems: "center", justifyContent: "center" }, historyDetailTitle: { color: c.text, fontFamily: "DMSans_700Bold", fontSize: 20, lineHeight: 27, marginBottom: 18 }, historyItem: { minHeight: 75, borderRadius: 14, borderWidth: 1, borderColor: c.border, backgroundColor: c.surface, paddingHorizontal: 14, flexDirection: "row", alignItems: "center" }, historyItemSelected: { borderColor: "#745FC0", backgroundColor: c.selected }, historyIcon: { width: 40, height: 40, borderRadius: 11, backgroundColor: c.purpleSurface, alignItems: "center", justifyContent: "center", marginRight: 12 }, historyBody: { flex: 1 }, historyTitle: { color: c.softText, fontFamily: "DMSans_600SemiBold", fontSize: 12.5 }, historyMeta: { color: c.faint, fontFamily: "DMSans_400Regular", fontSize: 9.5, marginTop: 4 }, historyStatus: { maxWidth: 128, minHeight: 25, paddingHorizontal: 8, borderRadius: 12.5, backgroundColor: c.purpleSurface, flexDirection: "row", alignItems: "center", gap: 5, marginLeft: 8 }, historyStatusCompleted: { backgroundColor: "rgba(52,211,153,0.12)" }, historyStatusFailed: { backgroundColor: "rgba(239,92,117,0.12)" }, historyStatusText: { color: c.purpleText, fontFamily: "DMSans_700Bold", fontSize: 7.5, textTransform: "uppercase" }, historyStatusCompletedText: { color: "#34B981" }, historyStatusFailedText: { color: "#E0526D" }, historyRowDelete: { width: 34, height: 34, marginLeft: 4, borderRadius: 10, alignItems: "center", justifyContent: "center" },
     mobileNav: { position: "absolute", bottom: 0, left: 0, right: 0, height: Platform.OS === "ios" ? 82 : 68, paddingBottom: Platform.OS === "ios" ? 15 : 3, borderTopWidth: 1, borderTopColor: c.border, backgroundColor: c.header, flexDirection: "row", justifyContent: "space-around", alignItems: "center" }, mobileNavItem: { width: 90, alignItems: "center", gap: 2 }, mobileNavText: { color: c.faint, fontFamily: "DMSans_500Medium", fontSize: 9 }, mobileNavTextActive: { color: c.purpleText },
   });
 }

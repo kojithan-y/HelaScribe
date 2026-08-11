@@ -22,6 +22,11 @@ export async function getTranscript(id: string): Promise<TranscriptRecord> {
   return response.json();
 }
 
+export async function deleteTranscript(id: string): Promise<void> {
+  const response = await fetch(`${API_URL}/history/${encodeURIComponent(id)}`, { method: "DELETE" });
+  if (!response.ok) throw new Error((await response.text()) || "Could not delete transcript");
+}
+
 export async function submitAudio(
   uri: string,
   name: string,
