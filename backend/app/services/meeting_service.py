@@ -2,6 +2,7 @@ import asyncio
 import io
 import json
 import secrets
+import shutil
 import time
 import wave
 from dataclasses import dataclass, field
@@ -87,6 +88,9 @@ class TrackState:
     shared_mic: bool
     start_offset: float
     pcm: bytearray = field(default_factory=bytearray)
+    pcm_size: int = 0
+    raw_path: Path | None = None
+    raw_file: Any = None
     pending: bytearray = field(default_factory=bytearray)
     queued_bytes: int = 0
     first_chunk: bool = True
@@ -94,14 +98,29 @@ class TrackState:
     final_segments: list[TranscriptSegment] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     queue: asyncio.Queue[tuple[bytes, float, float] | None] = field(
-        default_factory=asyncio.Queue
+        default_factory=lambda: asyncio.Queue(maxsize=4)
     )
     worker: asyncio.Task[None] | None = None
     capture_tasks: set[asyncio.Task[None]] = field(default_factory=set)
 
     @property
     def duration(self) -> float:
-        return len(self.pcm) / (SAMPLE_RATE * 2)
+        return (self.pcm_size + len(self.pcm)) / (SAMPLE_RATE * 2)
+
+    def append_audio(self, data: bytes) -> None:
+        if self.raw_file is not None:
+            self.raw_file.write(data)
+            self.pcm_size += len(data)
+        else:
+            self.pcm.extend(data)
+
+
+def raw_pcm_to_wav(raw_path: Path, wav_path: Path) -> None:
+    with raw_path.open("rb") as source, wave.open(str(wav_path), "wb") as output:
+        output.setnchannels(1)
+        output.setsampwidth(2)
+        output.setframerate(SAMPLE_RATE)
+        shutil.copyfileobj(source, output, length=1024 * 1024)
 
 
 class MeetingSession:
@@ -190,6 +209,16 @@ class MeetingSession:
             self.record.processing_stage = None
             self.record.error = f"Meeting worker failed: {exc}"
             await save_record(self.record)
+        finally:
+            for state in self.states.values():
+                if state.raw_file is not None:
+                    state.raw_file.close()
+                    state.raw_file = None
+                if state.raw_path and state.raw_path.exists():
+                    try:
+                        state.raw_path.unlink()
+                    except OSError:
+                        pass
 
     @staticmethod
     def _participant_metadata(participant: Any) -> dict[str, Any]:
@@ -210,6 +239,16 @@ class MeetingSession:
             shared_mic=shared_mic,
             start_offset=max(0.0, time.monotonic() - self.started_at),
         )
+        settings = get_settings()
+        safe_identity = "".join(
+            character if character.isalnum() or character in "-_" else "_"
+            for character in identity
+        )
+        state.raw_path = settings.data_dir / "audio" / f"{self.record.id}-{safe_identity}.pcm.part"
+        state.raw_file = state.raw_path.open("wb")
+        state.queue = asyncio.Queue(
+            maxsize=max(2, getattr(settings, "live_preview_queue_size", 4))
+        )
         state.worker = asyncio.create_task(self._transcribe_chunks(state))
         self.states[identity] = state
         return state
@@ -219,7 +258,7 @@ class MeetingSession:
         missing = int((target_duration - state.duration) * SAMPLE_RATE * 2)
         if missing > 0:
             silence = b"\0" * (missing - (missing % 2))
-            state.pcm.extend(silence)
+            state.append_audio(silence)
             state.pending.extend(silence)
 
     async def _consume_track(self, track: Any, state: TrackState) -> None:
@@ -238,7 +277,7 @@ class MeetingSession:
                 if self.ending:
                     break
                 data = bytes(event.frame.data)
-                state.pcm.extend(data)
+                state.append_audio(data)
                 state.pending.extend(data)
                 while len(state.pending) >= chunk_bytes:
                     chunk = bytes(state.pending[:chunk_bytes])
@@ -321,6 +360,9 @@ class MeetingSession:
                 for task in tuple(state.capture_tasks):
                     task.cancel()
                 await asyncio.gather(*state.capture_tasks, return_exceptions=True)
+            if state.raw_file is not None:
+                state.raw_file.close()
+                state.raw_file = None
             if state.pending:
                 offset = state.start_offset + state.queued_bytes / (SAMPLE_RATE * 2)
                 commit_after = (
@@ -356,24 +398,40 @@ class MeetingSession:
         await save_record(self.record)
 
     async def _finalize_state(self, state: TrackState) -> None:
-        if not state.pcm:
+        if state.duration <= 0:
             state.final_segments = state.preview_segments
             return
         settings = get_settings()
         if self.record.processing_stage != ProcessingStage.transcribing:
             self.record.processing_stage = ProcessingStage.transcribing
             await save_record(self.record)
-        audio = pcm_wav_bytes(bytes(state.pcm))
         safe_identity = "".join(
             character if character.isalnum() or character in "-_" else "_"
             for character in state.identity
         )
         filename = f"{self.record.id}-{safe_identity}.wav"
         path = settings.data_dir / "audio" / filename
-        await asyncio.to_thread(path.write_bytes, audio)
+        if state.raw_path and state.raw_path.is_file():
+            await asyncio.to_thread(raw_pcm_to_wav, state.raw_path, path)
+            await asyncio.to_thread(state.raw_path.unlink)
+            state.raw_path = None
+            if path.stat().st_size > settings.max_upload_mb * 1024 * 1024:
+                state.final_segments = state.preview_segments
+                state.warnings.append(
+                    f"{state.display_name} full-session pass skipped above "
+                    f"{settings.max_upload_mb} MB; live previews retained"
+                )
+                self.record.participant_audio[state.identity] = filename
+                return
+            audio = await asyncio.to_thread(path.read_bytes)
+            pcm_for_rms = audio[44:]
+        else:
+            pcm_for_rms = bytes(state.pcm)
+            audio = pcm_wav_bytes(pcm_for_rms)
+            await asyncio.to_thread(path.write_bytes, audio)
         self.record.participant_audio[state.identity] = filename
         try:
-            if pcm_rms(bytes(state.pcm)) < settings.live_silence_rms_threshold:
+            if pcm_rms(pcm_for_rms) < settings.live_silence_rms_threshold:
                 final: list[TranscriptSegment] = []
             else:
                 final = await GeminiService().transcribe_file(

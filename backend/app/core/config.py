@@ -24,9 +24,12 @@ class Settings(BaseSettings):
     gemini_retry_base_seconds: float = 1.0
     gemini_live_timeout_seconds: float = 30.0
     gemini_batch_timeout_seconds: float = 90.0
-    live_chunk_seconds: float = 8.0
-    live_chunk_overlap_seconds: float = 1.0
+    # Short speech windows keep the chunked generateContent preview responsive.
+    # The retained full recording is still transcribed after Stop for accuracy.
+    live_chunk_seconds: float = 3.0
+    live_chunk_overlap_seconds: float = 0.5
     live_stop_preview_grace_seconds: float = 3.0
+    live_preview_queue_size: int = 4
     live_silence_rms_threshold: float = 200.0
     live_finalize_full_audio: bool = True
     max_live_minutes: float = 120.0
@@ -40,6 +43,8 @@ class Settings(BaseSettings):
     huggingface_token: str | None = None
     pyannote_model: str = "pyannote/speaker-diarization-community-1"
     data_dir: Path = Path("data")
+    sentry_dsn: str | None = None
+    app_environment: str = "development"
 
     model_config = SettingsConfigDict(env_file=BACKEND_DIR / ".env", extra="ignore")
 

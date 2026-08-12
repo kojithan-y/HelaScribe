@@ -5,6 +5,7 @@ import type { Language, MeetingConnection, SessionType, TranscriptRecord, Transc
 
 export const API_URL = process.env.EXPO_PUBLIC_API_URL ?? "http://localhost:8000/api";
 export const WS_URL = API_URL.replace(/^http/, "ws") + "/live";
+export const HISTORY_WS_URL = API_URL.replace(/^http/, "ws") + "/history/events";
 
 export function getAudioUrl(id: string): string {
   return `${API_URL}/history/${encodeURIComponent(id)}/audio`;
@@ -21,6 +22,52 @@ export async function getTranscript(id: string): Promise<TranscriptRecord> {
   if (!response.ok) throw new Error("Could not load transcript");
   return response.json();
 }
+
+export async function updateTranscript(
+  id: string,
+  patch: { title?: string; segments?: TranscriptRecord["segments"] },
+): Promise<TranscriptRecord> {
+  const response = await fetch(`${API_URL}/history/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(patch),
+  });
+  if (!response.ok) throw new Error((await response.text()) || "Could not update transcript");
+  return response.json();
+}
+
+export async function renameTranscriptSpeaker(
+  id: string,
+  oldName: string,
+  newName: string,
+): Promise<TranscriptRecord> {
+  const response = await fetch(`${API_URL}/history/${encodeURIComponent(id)}/speakers/rename`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ old_name: oldName, new_name: newName }),
+  });
+  if (!response.ok) throw new Error((await response.text()) || "Could not rename speaker");
+  return response.json();
+}
+
+export async function translateTranscript(id: string, targetLanguage: Language): Promise<TranscriptRecord> {
+  const response = await fetch(`${API_URL}/history/${encodeURIComponent(id)}/translate`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ target_language: targetLanguage }),
+  });
+  if (!response.ok) throw new Error((await response.text()) || "Could not translate transcript");
+  return response.json();
+}
+
+async function jobAction(id: string, action: "cancel" | "retry"): Promise<{ id: string; status: string }> {
+  const response = await fetch(`${API_URL}/transcribe/${encodeURIComponent(id)}/${action}`, { method: "POST" });
+  if (!response.ok) throw new Error((await response.text()) || `Could not ${action} job`);
+  return response.json();
+}
+
+export const cancelTranscription = (id: string) => jobAction(id, "cancel");
+export const retryTranscription = (id: string) => jobAction(id, "retry");
 
 export async function deleteTranscript(id: string): Promise<void> {
   const response = await fetch(`${API_URL}/history/${encodeURIComponent(id)}`, { method: "DELETE" });

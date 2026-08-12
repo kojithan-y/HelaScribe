@@ -11,6 +11,8 @@ export interface Segment {
   speaker?: string | null;
   detected_language?: SpokenLanguage | null;
   participant_identity?: string | null;
+  uncertain?: boolean;
+  translated_text?: string | null;
 }
 
 export interface MeetingParticipant {

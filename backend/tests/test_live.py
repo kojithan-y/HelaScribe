@@ -27,6 +27,22 @@ def test_pcm_wav_bytes_preserves_stream_format() -> None:
         assert wav.readframes(wav.getnframes()) == pcm
 
 
+def test_raw_to_wav_streams_pcm_into_a_valid_wave_file(tmp_path: Path) -> None:
+    pcm = struct.pack("<6h", -1_000, 1_000, -500, 500, 0, 250)
+    raw_path = tmp_path / "recording.pcm.part"
+    wav_path = tmp_path / "recording.wav"
+    raw_path.write_bytes(pcm)
+
+    live._raw_to_wav(raw_path, wav_path, sample_rate=16_000)
+
+    with wave.open(str(wav_path), "rb") as wav:
+        assert wav.getnchannels() == 1
+        assert wav.getsampwidth() == 2
+        assert wav.getframerate() == 16_000
+        assert wav.getnframes() == len(pcm) // 2
+        assert wav.readframes(wav.getnframes()) == pcm
+
+
 def test_pcm_rms_rejects_silence_and_detects_audio() -> None:
     assert live._pcm_rms(b"\x00\x00" * 1_000) == 0
 

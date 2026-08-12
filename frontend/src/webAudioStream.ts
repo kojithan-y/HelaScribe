@@ -54,22 +54,61 @@ export async function startWebAudioStream(
   try {
     context = new AudioContextConstructor({ sampleRate: TARGET_SAMPLE_RATE });
     const source = context.createMediaStreamSource(mediaStream);
-    const processor = context.createScriptProcessor(4096, 1, 1);
     const silentOutput = context.createGain();
     silentOutput.gain.value = 0;
 
-    processor.onaudioprocess = (event) => {
-      const samples = event.inputBuffer.getChannelData(0);
+    const emit = (samples: Float32Array, sampleRate: number) => {
       let sumSquares = 0;
       for (let index = 0; index < samples.length; index += 1) {
         sumSquares += samples[index]! * samples[index]!;
       }
       const rms = Math.sqrt(sumSquares / Math.max(1, samples.length));
-      onBuffer(pcm16Buffer(samples, event.inputBuffer.sampleRate), Math.min(1, rms * 5));
+      onBuffer(pcm16Buffer(samples, sampleRate), Math.min(1, rms * 5));
     };
 
-    source.connect(processor);
-    processor.connect(silentOutput);
+    let disconnectProcessor: () => void;
+    if (context.audioWorklet) {
+      const workletSource = `
+        class HelaScribeCapture extends AudioWorkletProcessor {
+          process(inputs) {
+            const channel = inputs[0] && inputs[0][0];
+            if (channel && channel.length) this.port.postMessage(channel.slice(0));
+            return true;
+          }
+        }
+        registerProcessor("helascribe-capture", HelaScribeCapture);
+      `;
+      const moduleUrl = URL.createObjectURL(new Blob([workletSource], { type: "text/javascript" }));
+      try {
+        await context.audioWorklet.addModule(moduleUrl);
+      } finally {
+        URL.revokeObjectURL(moduleUrl);
+      }
+      const worklet = new AudioWorkletNode(context, "helascribe-capture", {
+        numberOfInputs: 1,
+        numberOfOutputs: 1,
+        outputChannelCount: [1],
+      });
+      worklet.port.onmessage = (event: MessageEvent<Float32Array>) => emit(event.data, context!.sampleRate);
+      source.connect(worklet);
+      worklet.connect(silentOutput);
+      disconnectProcessor = () => {
+        worklet.port.onmessage = null;
+        source.disconnect(worklet);
+        worklet.disconnect();
+      };
+    } else {
+      // Compatibility fallback for older embedded browsers.
+      const legacy = context.createScriptProcessor(4096, 1, 1);
+      legacy.onaudioprocess = (event) => emit(event.inputBuffer.getChannelData(0), event.inputBuffer.sampleRate);
+      source.connect(legacy);
+      legacy.connect(silentOutput);
+      disconnectProcessor = () => {
+        legacy.onaudioprocess = null;
+        source.disconnect(legacy);
+        legacy.disconnect();
+      };
+    }
     silentOutput.connect(context.destination);
     await context.resume();
 
@@ -78,9 +117,7 @@ export async function startWebAudioStream(
       stop: async () => {
         if (stopped) return;
         stopped = true;
-        processor.onaudioprocess = null;
-        source.disconnect();
-        processor.disconnect();
+        disconnectProcessor();
         silentOutput.disconnect();
         mediaStream.getTracks().forEach((track) => track.stop());
         if (context?.state !== "closed") await context?.close();

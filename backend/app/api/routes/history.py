@@ -5,11 +5,20 @@ import logging
 from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 
 from app.core.config import get_settings
-from app.models.schemas import JobStatus, TranscriptRecord, TranscriptSummary
+from app.models.schemas import (
+    JobStatus,
+    Language,
+    SessionType,
+    SpeakerRename,
+    TranscriptEdit,
+    TranscriptRecord,
+    TranscriptSummary,
+    TranscriptTranslate,
+)
 from app.services.gemini_service import GeminiService
 
 router = APIRouter(prefix="/history", tags=["history"])
@@ -18,6 +27,21 @@ _lock = asyncio.Lock()
 _loaded = False
 _summary_locks: dict[str, asyncio.Lock] = {}
 logger = logging.getLogger(__name__)
+_subscribers: set[asyncio.Queue[dict]] = set()
+
+
+async def _publish(event: dict) -> None:
+    """Fan out status changes without allowing slow clients to block jobs."""
+    for queue in tuple(_subscribers):
+        if queue.full():
+            try:
+                queue.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+        try:
+            queue.put_nowait(event)
+        except asyncio.QueueFull:
+            logger.warning("Dropped history event for a slow subscriber")
 
 
 def _history_path() -> Path:
@@ -59,6 +83,7 @@ async def save_record(record: TranscriptRecord) -> TranscriptRecord:
             indent=2,
         )
         await asyncio.to_thread(_write_history, payload)
+    await _publish({"type": "record", "record": record.model_dump(mode="json")})
     return record
 
 
@@ -68,9 +93,27 @@ async def get_record(record_id: str) -> TranscriptRecord | None:
 
 
 @router.get("", response_model=list[TranscriptRecord])
-async def list_history() -> list[TranscriptRecord]:
+async def list_history(
+    q: str | None = None,
+    language: Language | None = None,
+    session_type: SessionType | None = None,
+    status: JobStatus | None = None,
+) -> list[TranscriptRecord]:
     await _ensure_loaded()
-    return sorted(_records.values(), key=lambda item: item.created_at, reverse=True)
+    records = list(_records.values())
+    if language is not None:
+        records = [item for item in records if item.language == language]
+    if session_type is not None:
+        records = [item for item in records if item.session_type == session_type]
+    if status is not None:
+        records = [item for item in records if item.status == status]
+    if q:
+        needle = q.casefold().strip()
+        records = [
+            item for item in records
+            if needle in item.title.casefold() or needle in item.transcript.casefold()
+        ]
+    return sorted(records, key=lambda item: item.created_at, reverse=True)
 
 
 @router.get("/{record_id}", response_model=TranscriptRecord)
@@ -79,6 +122,82 @@ async def history_detail(record_id: str) -> TranscriptRecord:
     if not record:
         raise HTTPException(status_code=404, detail="Transcript not found")
     return record
+
+
+@router.patch("/{record_id}", response_model=TranscriptRecord)
+async def edit_history(record_id: str, body: TranscriptEdit) -> TranscriptRecord:
+    record = await get_record(record_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="Transcript not found")
+    if record.status != JobStatus.completed:
+        raise HTTPException(status_code=409, detail="Only completed transcripts can be edited")
+    if body.title is not None:
+        record.title = body.title.strip()
+    if body.segments is not None:
+        record.segments = sorted(body.segments, key=lambda item: (item.start, item.end))
+        record.transcript = "\n".join(
+            f"{item.speaker}: {item.text}" if item.speaker else item.text
+            for item in record.segments
+        )
+        record.summary = None
+        record.summary_source_hash = None
+    return await save_record(record)
+
+
+@router.post("/{record_id}/speakers/rename", response_model=TranscriptRecord)
+async def rename_speaker(record_id: str, body: SpeakerRename) -> TranscriptRecord:
+    record = await get_record(record_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="Transcript not found")
+    changed = False
+    for segment in record.segments:
+        if segment.speaker == body.old_name:
+            segment.speaker = body.new_name.strip()
+            changed = True
+    if not changed:
+        raise HTTPException(status_code=404, detail="Speaker label not found")
+    record.transcript = "\n".join(
+        f"{item.speaker}: {item.text}" if item.speaker else item.text
+        for item in record.segments
+    )
+    record.summary = None
+    record.summary_source_hash = None
+    return await save_record(record)
+
+
+@router.post("/{record_id}/translate", response_model=TranscriptRecord)
+async def translate_history(record_id: str, body: TranscriptTranslate) -> TranscriptRecord:
+    record = await get_record(record_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="Transcript not found")
+    if record.status != JobStatus.completed or not record.segments:
+        raise HTTPException(status_code=409, detail="A completed transcript is required")
+    if body.target_language == Language.mixed:
+        raise HTTPException(status_code=422, detail="Choose one translation language")
+    try:
+        translated = await GeminiService().translate_segments(record.segments, body.target_language)
+    except Exception as exc:
+        logger.exception("Translation failed for %s", record_id)
+        raise HTTPException(status_code=502, detail="Translation failed; please try again") from exc
+    for segment, text in zip(record.segments, translated, strict=True):
+        segment.translated_text = text
+    return await save_record(record)
+
+
+@router.websocket("/events")
+async def history_events(websocket: WebSocket) -> None:
+    await websocket.accept()
+    queue: asyncio.Queue[dict] = asyncio.Queue(maxsize=100)
+    _subscribers.add(queue)
+    try:
+        await websocket.send_json({"type": "ready"})
+        while True:
+            event = await queue.get()
+            await websocket.send_json(event)
+    except WebSocketDisconnect:
+        pass
+    finally:
+        _subscribers.discard(queue)
 
 
 @router.get("/{record_id}/audio", response_class=FileResponse)
@@ -170,3 +289,4 @@ async def delete_history(record_id: str) -> None:
         audio_path = get_settings().data_dir / "audio" / Path(filename).name
         if audio_path.is_file():
             await asyncio.to_thread(audio_path.unlink)
+    await _publish({"type": "deleted", "id": record_id})

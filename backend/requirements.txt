@@ -8,3 +8,4 @@ pyannote.audio==4.0.2
 imageio-ffmpeg>=0.6,<1
 livekit==1.1.13
 livekit-api==1.2.0
+sentry-sdk[fastapi]>=2.0,<3.0

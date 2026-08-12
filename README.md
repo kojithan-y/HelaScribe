@@ -62,6 +62,12 @@ the Android phone to the same Wi-Fi network and scan the QR code in Expo Go. A l
 (for example, `http://192.168.1.100:8000/api`), because `localhost` on a physical phone
 refers to the phone itself. Android Emulator commonly uses `http://10.0.2.2:8000/api`.
 
+USB-only development is also supported on Android. Enable USB debugging, connect and
+authorize the phone, make sure `adb` is installed and available on `PATH`, then run
+`npm run start:usb`. This reverses Metro port `8081` and API port `8000` through ADB and
+temporarily overrides the API URL with `http://127.0.0.1:8000/api`; it does not modify
+the LAN value stored in `frontend/.env`. Keep the cable connected while using this mode.
+
 If the phone cannot reach Metro over the local network, use `npm run start:tunnel` for
 the JavaScript bundle. The API URL still needs to be reachable by the phone; Windows
 Firewall may prompt you to allow Node.js and Python on private networks.

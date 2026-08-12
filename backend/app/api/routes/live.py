@@ -40,6 +40,16 @@ def _write_pcm_wav(path: Path, pcm: bytes, sample_rate: int) -> None:
     path.write_bytes(_pcm_wav_bytes(pcm, sample_rate))
 
 
+def _raw_to_wav(raw_path: Path, path: Path, sample_rate: int) -> None:
+    """Wrap a streamed PCM file as WAV without loading the session into RAM."""
+    with raw_path.open("rb") as source, wave.open(str(path), "wb") as output:
+        output.setnchannels(1)
+        output.setsampwidth(2)
+        output.setframerate(sample_rate)
+        while chunk := source.read(1024 * 1024):
+            output.writeframesraw(chunk)
+
+
 def _is_committed_segment(segment: TranscriptSegment, commit_after: float) -> bool:
     return (segment.start + segment.end) / 2 >= commit_after
 
@@ -155,9 +165,11 @@ async def _finalize_live(record: TranscriptRecord, path: Path) -> None:
 @router.websocket("/live")
 async def live_transcription(websocket: WebSocket) -> None:
     await websocket.accept()
-    pcm = bytearray()
     pending = bytearray()
+    pcm_size = 0
     record: TranscriptRecord | None = None
+    raw_path: Path | None = None
+    raw_file = None
     stopped = False
     worker: asyncio.Task | None = None
     try:
@@ -172,6 +184,8 @@ async def live_transcription(websocket: WebSocket) -> None:
             audio_filename="pending.wav",
         )
         record.audio_filename = f"{record.id}.wav"
+        raw_path = get_settings().data_dir / "audio" / f"{record.id}.pcm.part"
+        raw_file = raw_path.open("wb")
         await save_record(record)
         await websocket.send_json({"type": "ready", "id": record.id})
 
@@ -181,7 +195,9 @@ async def live_transcription(websocket: WebSocket) -> None:
             start.sample_rate * 2,
             int(settings.live_chunk_seconds * start.sample_rate * 2),
         )
-        queue: asyncio.Queue[tuple[bytes, float, float] | None] = asyncio.Queue()
+        queue: asyncio.Queue[tuple[bytes, float, float] | None] = asyncio.Queue(
+            maxsize=max(2, getattr(settings, "live_preview_queue_size", 4))
+        )
 
         async def transcribe_chunks() -> None:
             warning_sent = False
@@ -237,11 +253,12 @@ async def live_transcription(websocket: WebSocket) -> None:
             message = await websocket.receive()
             if message.get("bytes") is not None:
                 chunk = message["bytes"]
-                if len(pcm) + len(chunk) > max_pcm_bytes:
+                if pcm_size + len(chunk) > max_pcm_bytes:
                     raise ValueError(
                         f"Live session exceeds the {settings.max_live_minutes:g} minute limit"
                     )
-                pcm.extend(chunk)
+                raw_file.write(chunk)
+                pcm_size += len(chunk)
                 pending.extend(chunk)
                 while len(pending) >= chunk_bytes:
                     live_chunk = bytes(pending[:chunk_bytes])
@@ -253,7 +270,7 @@ async def live_transcription(websocket: WebSocket) -> None:
                     first_chunk = False
             elif message.get("text") == "stop":
                 stopped = True
-                if _can_finalize_from_full_audio(len(pcm)):
+                if _can_finalize_from_full_audio(pcm_size):
                     # The authoritative full-audio pass will cover the entire
                     # recording. Give only the in-flight preview a short chance
                     # to finish, then stop waiting for stale preview calls.
@@ -286,8 +303,12 @@ async def live_transcription(websocket: WebSocket) -> None:
         path = settings.data_dir / "audio" / record.audio_filename
         record.processing_stage = ProcessingStage.saving_audio
         await save_record(record)
-        await asyncio.to_thread(_write_pcm_wav, path, bytes(pcm), start.sample_rate)
-        record.duration_seconds = len(pcm) / (start.sample_rate * 2)
+        raw_file.close()
+        raw_file = None
+        await asyncio.to_thread(_raw_to_wav, raw_path, path, start.sample_rate)
+        await asyncio.to_thread(raw_path.unlink)
+        raw_path = None
+        record.duration_seconds = pcm_size / (start.sample_rate * 2)
         await save_record(record)
         _start_background_finalization(record, path)
         await websocket.send_json({"type": "finalizing", "id": record.id})
@@ -306,6 +327,11 @@ async def live_transcription(websocket: WebSocket) -> None:
         except Exception:
             pass
     finally:
+        if raw_file:
+            raw_file.close()
+        if raw_path and raw_path.exists():
+            with suppress(OSError):
+                raw_path.unlink()
         if worker and not worker.done():
             worker.cancel()
         if record and not stopped and record.status == JobStatus.processing:

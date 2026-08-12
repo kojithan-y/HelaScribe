@@ -47,6 +47,8 @@ class TranscriptSegment(BaseModel):
     speaker: str | None = None
     detected_language: SpokenLanguage | None = None
     participant_identity: str | None = None
+    uncertain: bool = False
+    translated_text: str | None = None
 
     @model_validator(mode="after")
     def validate_timeline(self) -> "TranscriptSegment":
@@ -147,3 +149,17 @@ class MeetingConnection(BaseModel):
 
 class MeetingEnd(BaseModel):
     host_secret: str = Field(min_length=1)
+
+
+class TranscriptEdit(BaseModel):
+    title: str | None = Field(default=None, min_length=1, max_length=200)
+    segments: list[TranscriptSegment] | None = None
+
+
+class SpeakerRename(BaseModel):
+    old_name: str = Field(min_length=1, max_length=120)
+    new_name: str = Field(min_length=1, max_length=120)
+
+
+class TranscriptTranslate(BaseModel):
+    target_language: Language
