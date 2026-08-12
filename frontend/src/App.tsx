@@ -4,6 +4,7 @@ import {
   Alert,
   Animated,
   Easing,
+  Modal,
   Platform,
   Pressable,
   ScrollView,
@@ -62,7 +63,11 @@ const SESSION_TYPES: Array<{
   { value: "Meeting", label: "Meeting", hint: "Join multiple devices", icon: "users" },
 ];
 
-const waveform = [18, 30, 45, 25, 58, 38, 68, 48, 26, 54, 73, 42, 62, 30, 50, 22, 38, 66, 44, 28, 56, 35, 18];
+const waveform = [
+  16, 24, 35, 22, 45, 30, 54, 38, 25, 48, 60, 34, 52,
+  28, 43, 20, 32, 56, 39, 24, 49, 31, 18, 36, 58, 42,
+  27, 51, 33, 63, 40, 23, 47, 29, 54, 35, 21, 39, 17,
+];
 
 function formatTime(seconds: number) {
   const minutes = Math.floor(seconds / 60).toString().padStart(2, "0");
@@ -85,6 +90,8 @@ const PROCESSING_LABELS: Record<ProcessingStage, string> = {
   transcribing: "Transcribing",
   diarizing: "Identifying speakers",
 };
+
+const LIVE_CONNECTION_TIMEOUT_MS = 12_000;
 
 function recordStatusLabel(record: Pick<TranscriptRecord, "status" | "processing_stage">) {
   if (record.status === "processing" && record.processing_stage) {
@@ -135,7 +142,7 @@ function AnimatedWaveform({ active, intensity, styles }: { active: boolean; inte
         const profile = 0.55 + (waveform[index]! / 73) * 0.45;
         const target = state.active
           ? Math.min(1, 0.12 + energy * motion * profile)
-          : 0.06 + motion * profile * 0.1;
+          : 0.04 + motion * profile * 0.075;
         return Animated.timing(level, {
           toValue: target,
           duration: state.active ? 135 : 360,
@@ -284,8 +291,8 @@ function TranscriptPanel({
         {segments.length === 0 ? (
           <View style={styles.emptyTranscript}>
             <View style={styles.emptyIcon}><MaterialCommunityIcons name="waveform" size={26} color="#8F8A9E" /></View>
-            <Text style={styles.emptyTitle}>{isProcessing ? "Transcript on the way" : "Ready when you are"}</Text>
-            <Text style={styles.emptyCopy}>{isProcessing ? "Your final text will appear here automatically." : "Choose your language and session type, then start transcribing."}</Text>
+            <Text style={styles.emptyTitle}>{isProcessing ? "Transcript on the way" : active && status === "recording" ? "Recording in progress" : active ? "Listening for speech" : "Ready when you are"}</Text>
+            <Text style={styles.emptyCopy}>{isProcessing ? "Your final text will appear here automatically." : active && status === "recording" ? "Tap Stop session when you finish. This mode transcribes the saved recording after you stop." : active ? "Speak clearly and live text will appear here." : "Choose your language and session type, then start transcribing."}</Text>
           </View>
         ) : segments.map((segment, index) => (
           <View key={`${segment.start}-${index}`} style={styles.segmentRow}>
@@ -331,6 +338,8 @@ export default function App() {
   const [segments, setSegments] = useState<Segment[]>([]);
   const [history, setHistory] = useState<TranscriptRecord[]>([]);
   const [selected, setSelected] = useState<TranscriptRecord | null>(null);
+  const [deleteCandidate, setDeleteCandidate] = useState<TranscriptRecord | null>(null);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
   const [deletingRecordId, setDeletingRecordId] = useState<string | null>(null);
   const [trackedJobIds, setTrackedJobIds] = useState<string[]>([]);
   const [currentRecordId, setCurrentRecordId] = useState<string | null>(null);
@@ -406,32 +415,30 @@ export default function App() {
   }, []);
 
   const confirmDelete = (record: TranscriptRecord) => {
-    Alert.alert(
-      "Delete transcript?",
-      `“${record.title}” and its saved audio will be permanently removed.`,
-      [
-        { text: "Cancel", style: "cancel" },
-        {
-          text: "Delete",
-          style: "destructive",
-          onPress: () => {
-            setDeletingRecordId(record.id);
-            void deleteTranscript(record.id)
-              .then(() => {
-                setHistory((current) => current.filter((item) => item.id !== record.id));
-                setSelected((current) => current?.id === record.id ? null : current);
-                setTrackedJobIds((current) => current.filter((id) => id !== record.id));
-                if (currentRecordId === record.id) {
-                  setCurrentRecordId(null);
-                  setSegments([]);
-                }
-              })
-              .catch((error) => Alert.alert("Delete failed", error instanceof Error ? error.message : "Could not delete transcript"))
-              .finally(() => setDeletingRecordId(null));
-          },
-        },
-      ],
-    );
+    setDeleteError(null);
+    setDeleteCandidate(record);
+  };
+
+  const performDelete = async () => {
+    const record = deleteCandidate;
+    if (!record || deletingRecordId) return;
+    setDeleteError(null);
+    setDeletingRecordId(record.id);
+    try {
+      await deleteTranscript(record.id);
+      setHistory((current) => current.filter((item) => item.id !== record.id));
+      setSelected((current) => current?.id === record.id ? null : current);
+      setTrackedJobIds((current) => current.filter((id) => id !== record.id));
+      if (currentRecordId === record.id) {
+        setCurrentRecordId(null);
+        setSegments([]);
+      }
+      setDeleteCandidate(null);
+    } catch (error) {
+      setDeleteError(error instanceof Error ? error.message : "Could not delete transcript");
+    } finally {
+      setDeletingRecordId(null);
+    }
   };
 
   useEffect(() => { void refreshHistory(); }, [refreshHistory]);
@@ -505,6 +512,17 @@ export default function App() {
     const socket = new WebSocket(WS_URL);
     socket.binaryType = "arraybuffer";
     socketRef.current = socket;
+    const connectionTimer = setTimeout(() => {
+      if (socketRef.current !== socket || socket.readyState === WebSocket.CLOSED) return;
+      socketRef.current = null;
+      socket.close();
+      void stopAudioCapture();
+      setActive(false);
+      setBusy(false);
+      setStatus("offline");
+      Alert.alert("Connection timed out", `The backend did not respond at ${WS_URL}. Check that both devices are on the same network.`);
+    }, LIVE_CONNECTION_TIMEOUT_MS);
+    const clearConnectionTimer = () => clearTimeout(connectionTimer);
     socket.onopen = () => {
       socket.send(JSON.stringify({ language, diarization, sample_rate: 16000, title: `Live • ${new Date().toLocaleString()}` }));
     };
@@ -513,6 +531,7 @@ export default function App() {
         try {
           const message = JSON.parse(String(event.data));
           if (message.type === "ready") {
+            clearConnectionTimer();
             trackJob(message.id);
             setCurrentRecordId(message.id);
             setProcessingStage("recording");
@@ -529,6 +548,7 @@ export default function App() {
             setProcessingStage("transcribing");
             setBusy(false);
           } else if (message.type === "error") {
+            clearConnectionTimer();
             await stopAudioCapture();
             setActive(false);
             setBusy(false);
@@ -545,6 +565,7 @@ export default function App() {
       })();
     };
     socket.onerror = () => {
+      clearConnectionTimer();
       if (socketRef.current !== socket) return;
       void stopAudioCapture();
       setActive(false);
@@ -553,6 +574,7 @@ export default function App() {
       Alert.alert("Connection failed", `Could not connect to ${WS_URL}`);
     };
     socket.onclose = () => {
+      clearConnectionTimer();
       if (socketRef.current === socket) {
         socketRef.current = null;
         void stopAudioCapture();
@@ -896,6 +918,38 @@ export default function App() {
         </ScrollView>
       )}
 
+      <Modal
+        transparent
+        visible={deleteCandidate !== null}
+        animationType="fade"
+        onRequestClose={() => { if (!deletingRecordId) setDeleteCandidate(null); }}
+      >
+        <View style={styles.modalOverlay}>
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel="Cancel delete"
+            disabled={deletingRecordId !== null}
+            onPress={() => setDeleteCandidate(null)}
+            style={StyleSheet.absoluteFill}
+          />
+          <View accessibilityRole="alert" style={styles.deleteDialog}>
+            <View style={styles.deleteDialogIcon}><Feather name="trash-2" size={20} color="#EF6A7F" /></View>
+            <Text style={styles.deleteDialogTitle}>Delete transcript?</Text>
+            <Text style={styles.deleteDialogCopy}>“{deleteCandidate?.title}” and its saved audio will be permanently removed.</Text>
+            {deleteError ? <Text style={styles.deleteDialogError}>{deleteError}</Text> : null}
+            <View style={styles.deleteDialogActions}>
+              <Pressable disabled={deletingRecordId !== null} onPress={() => setDeleteCandidate(null)} style={styles.deleteCancelButton}>
+                <Text style={styles.deleteCancelText}>Cancel</Text>
+              </Pressable>
+              <Pressable disabled={deletingRecordId !== null} onPress={() => void performDelete()} style={styles.deleteConfirmButton}>
+                {deletingRecordId ? <ActivityIndicator color="white" size={15} /> : <Feather name="trash-2" size={15} color="white" />}
+                <Text style={styles.deleteConfirmText}>{deletingRecordId ? "Deleting…" : "Delete"}</Text>
+              </Pressable>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
       {!isWide ? (
         <View style={styles.mobileNav}>
           <Pressable onPress={() => { setTab("new"); setSelected(null); }} style={styles.mobileNavItem}><Ionicons name={tab === "new" ? "add-circle" : "add-circle-outline"} size={24} color={tab === "new" ? "#B9A7FF" : "#777181"} /><Text style={[styles.mobileNavText, tab === "new" && styles.mobileNavTextActive]}>New</Text></Pressable>
@@ -934,10 +988,11 @@ function createStyles(isDark: boolean) {
     meetingCard: { gap: 11, padding: 14, borderRadius: 15, borderWidth: 1, borderColor: c.border, backgroundColor: c.surface }, meetingHeader: { flexDirection: "row", alignItems: "center", justifyContent: "space-between" }, roomCode: { color: c.purpleText, fontFamily: "DMSans_700Bold", fontSize: 15, letterSpacing: 1.5 }, meetingInput: { height: 44, borderRadius: 11, borderWidth: 1, borderColor: c.border, backgroundColor: c.raised, color: c.text, paddingHorizontal: 13, fontFamily: "DMSans_500Medium", fontSize: 12 }, meetingJoinRow: { flexDirection: "row", gap: 9 }, meetingCodeInput: { flex: 1, letterSpacing: 1.3 }, joinButton: { width: 86, borderRadius: 11, backgroundColor: c.purpleSurface, borderWidth: 1, borderColor: c.strongBorder, alignItems: "center", justifyContent: "center" }, joinButtonText: { color: c.purpleText, fontFamily: "DMSans_700Bold", fontSize: 11 }, participantList: { flexDirection: "row", flexWrap: "wrap", gap: 8 }, participantChip: { flexDirection: "row", alignItems: "center", gap: 6, paddingHorizontal: 9, height: 30, borderRadius: 15, backgroundColor: c.raised }, participantText: { color: c.body, fontFamily: "DMSans_500Medium", fontSize: 10 },
     primaryWrap: { borderRadius: 14, overflow: "hidden", marginTop: -4 }, primaryButton: { height: 55, flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 10 }, primaryText: { color: "white", fontFamily: "DMSans_600SemiBold", fontSize: 14 }, privacyRow: { flexDirection: "row", justifyContent: "center", alignItems: "center", gap: 6, marginTop: -13 }, privacyText: { color: c.faint, fontFamily: "DMSans_400Regular", fontSize: 8.5, textAlign: "center" },
     transcriptCard: { flex: 1, minHeight: 535, borderRadius: 20, borderWidth: 1, borderColor: c.border, backgroundColor: c.panel, overflow: "hidden" }, transcriptHeader: { height: 88, paddingHorizontal: 22, flexDirection: "row", alignItems: "center", justifyContent: "space-between", borderBottomWidth: 1, borderBottomColor: c.border }, panelEyebrow: { color: c.faint, fontFamily: "DMSans_700Bold", fontSize: 8, letterSpacing: 1.7 }, panelTitle: { color: c.softText, fontFamily: "DMSans_600SemiBold", fontSize: 15, marginTop: 5 }, liveBadge: { paddingHorizontal: 10, height: 25, borderRadius: 12.5, backgroundColor: "rgba(229,72,103,0.13)", flexDirection: "row", alignItems: "center", gap: 6 }, idleBadge: { backgroundColor: c.raised }, liveDot: { width: 6, height: 6, borderRadius: 3, backgroundColor: "#F15E78" }, idleDot: { backgroundColor: c.muted }, liveText: { color: "#E0526D", fontFamily: "DMSans_700Bold", fontSize: 8, letterSpacing: 1 }, idleText: { color: c.muted },
-    waveform: { height: 78, marginHorizontal: 22, marginTop: 14, paddingHorizontal: 16, borderRadius: 16, borderWidth: 1, borderColor: c.border, backgroundColor: c.raised, flexDirection: "row", alignItems: "center", justifyContent: "space-between" }, waveBar: { width: 3, borderRadius: 3, backgroundColor: "#9F7AEA" }, timelineRow: { flexDirection: "row", alignItems: "center", gap: 10, paddingHorizontal: 22, paddingTop: 10, paddingBottom: 14 }, timeText: { color: c.faint, fontFamily: "DMSans_500Medium", fontSize: 8 }, timeline: { flex: 1, height: 1, backgroundColor: c.border }, transcriptScroll: { flex: 1, borderTopWidth: 1, borderTopColor: c.border }, transcriptContent: { flexGrow: 1, padding: 22 }, emptyTranscript: { flex: 1, minHeight: 230, alignItems: "center", justifyContent: "center", paddingHorizontal: 32 }, emptyIcon: { width: 55, height: 55, borderRadius: 27.5, backgroundColor: c.raised, alignItems: "center", justifyContent: "center", marginBottom: 14 }, emptyTitle: { color: c.body, fontFamily: "DMSans_600SemiBold", fontSize: 13 }, emptyCopy: { color: c.faint, fontFamily: "DMSans_400Regular", fontSize: 10.5, lineHeight: 16, textAlign: "center", marginTop: 6 }, segmentRow: { flexDirection: "row", marginBottom: 19 }, segmentTime: { width: 42, color: c.faint, fontFamily: "DMSans_500Medium", fontSize: 9, paddingTop: 2 }, speakerLine: { width: 2, borderRadius: 2, marginRight: 12 }, segmentBody: { flex: 1 }, segmentMeta: { flexDirection: "row", alignItems: "center", gap: 7, marginBottom: 4 }, speakerName: { fontFamily: "DMSans_700Bold", fontSize: 9, textTransform: "uppercase", letterSpacing: 0.7 }, languageTag: { color: c.faint, backgroundColor: c.raised, borderRadius: 7, overflow: "hidden", paddingHorizontal: 6, paddingVertical: 2, fontFamily: "DMSans_600SemiBold", fontSize: 7.5, textTransform: "uppercase", letterSpacing: 0.5 }, segmentText: { color: c.body, fontFamily: "DMSans_400Regular", fontSize: 12.5, lineHeight: 19 },
+    waveform: { height: 78, marginHorizontal: 22, marginTop: 14, paddingHorizontal: 10, borderRadius: 16, borderWidth: 1, borderColor: c.border, backgroundColor: c.raised, flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 3 }, waveBar: { width: 3, borderRadius: 3, backgroundColor: "#9F7AEA" }, timelineRow: { flexDirection: "row", alignItems: "center", gap: 10, paddingHorizontal: 22, paddingTop: 10, paddingBottom: 14 }, timeText: { color: c.faint, fontFamily: "DMSans_500Medium", fontSize: 8 }, timeline: { flex: 1, height: 1, backgroundColor: c.border }, transcriptScroll: { flex: 1, borderTopWidth: 1, borderTopColor: c.border }, transcriptContent: { flexGrow: 1, padding: 22 }, emptyTranscript: { flex: 1, minHeight: 230, alignItems: "center", justifyContent: "center", paddingHorizontal: 32 }, emptyIcon: { width: 55, height: 55, borderRadius: 27.5, backgroundColor: c.raised, alignItems: "center", justifyContent: "center", marginBottom: 14 }, emptyTitle: { color: c.body, fontFamily: "DMSans_600SemiBold", fontSize: 13 }, emptyCopy: { color: c.faint, fontFamily: "DMSans_400Regular", fontSize: 10.5, lineHeight: 16, textAlign: "center", marginTop: 6 }, segmentRow: { flexDirection: "row", marginBottom: 19 }, segmentTime: { width: 42, color: c.faint, fontFamily: "DMSans_500Medium", fontSize: 9, paddingTop: 2 }, speakerLine: { width: 2, borderRadius: 2, marginRight: 12 }, segmentBody: { flex: 1 }, segmentMeta: { flexDirection: "row", alignItems: "center", gap: 7, marginBottom: 4 }, speakerName: { fontFamily: "DMSans_700Bold", fontSize: 9, textTransform: "uppercase", letterSpacing: 0.7 }, languageTag: { color: c.faint, backgroundColor: c.raised, borderRadius: 7, overflow: "hidden", paddingHorizontal: 6, paddingVertical: 2, fontFamily: "DMSans_600SemiBold", fontSize: 7.5, textTransform: "uppercase", letterSpacing: 0.5 }, segmentText: { color: c.body, fontFamily: "DMSans_400Regular", fontSize: 12.5, lineHeight: 19 },
     audioPlayer: { marginHorizontal: 22, marginBottom: 16, flexDirection: "row", alignItems: "center", gap: 10 }, audioPlayButton: { width: 34, height: 34, borderRadius: 17, backgroundColor: "#755BD0", alignItems: "center", justifyContent: "center" }, audioProgressTouch: { flex: 1, height: 30, justifyContent: "center" }, audioProgressTrack: { width: "100%", height: 5, borderRadius: 3, backgroundColor: c.raised }, audioProgressFill: { height: "100%", borderRadius: 3, backgroundColor: "#9F7AEA" }, audioProgressThumb: { position: "absolute", top: -4, width: 13, height: 13, marginLeft: -6.5, borderRadius: 7, borderWidth: 2, borderColor: c.panel, backgroundColor: "#B9A7FF" }, audioTime: { minWidth: 72, color: c.faint, fontFamily: "DMSans_500Medium", fontSize: 8, textAlign: "right" },
     processingCard: { marginHorizontal: 22, marginBottom: 16, padding: 14, borderRadius: 13, borderWidth: 1, borderColor: c.strongBorder, backgroundColor: c.purpleSurface, flexDirection: "row", alignItems: "center", gap: 12 }, processingBody: { flex: 1 }, processingTitle: { color: c.purpleText, fontFamily: "DMSans_700Bold", fontSize: 11 }, processingCopy: { color: c.muted, fontFamily: "DMSans_400Regular", fontSize: 9.5, lineHeight: 14, marginTop: 3 },
     historyPage: { paddingHorizontal: 22, paddingTop: 48, paddingBottom: 110 }, historyLayout: { width: "100%", maxWidth: 1180, alignSelf: "center", gap: 22 }, historyLayoutWide: { flexDirection: "row" }, historyList: { flex: 0.85, gap: 9 }, historyDetail: { width: "100%", maxWidth: 760, alignSelf: "center" }, historyDetailActions: { minHeight: 44, flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }, historyBackButton: { minHeight: 40, flexDirection: "row", alignItems: "center", gap: 8 }, historyBackText: { color: c.purpleText, fontFamily: "DMSans_600SemiBold", fontSize: 12 }, historyDeleteButton: { width: 38, height: 38, borderRadius: 11, borderWidth: 1, borderColor: "rgba(239,106,127,0.25)", backgroundColor: "rgba(239,106,127,0.08)", alignItems: "center", justifyContent: "center" }, historyDetailTitle: { color: c.text, fontFamily: "DMSans_700Bold", fontSize: 20, lineHeight: 27, marginBottom: 18 }, historyItem: { minHeight: 75, borderRadius: 14, borderWidth: 1, borderColor: c.border, backgroundColor: c.surface, paddingHorizontal: 14, flexDirection: "row", alignItems: "center" }, historyItemSelected: { borderColor: "#745FC0", backgroundColor: c.selected }, historyIcon: { width: 40, height: 40, borderRadius: 11, backgroundColor: c.purpleSurface, alignItems: "center", justifyContent: "center", marginRight: 12 }, historyBody: { flex: 1 }, historyTitle: { color: c.softText, fontFamily: "DMSans_600SemiBold", fontSize: 12.5 }, historyMeta: { color: c.faint, fontFamily: "DMSans_400Regular", fontSize: 9.5, marginTop: 4 }, historyStatus: { maxWidth: 128, minHeight: 25, paddingHorizontal: 8, borderRadius: 12.5, backgroundColor: c.purpleSurface, flexDirection: "row", alignItems: "center", gap: 5, marginLeft: 8 }, historyStatusCompleted: { backgroundColor: "rgba(52,211,153,0.12)" }, historyStatusFailed: { backgroundColor: "rgba(239,92,117,0.12)" }, historyStatusText: { color: c.purpleText, fontFamily: "DMSans_700Bold", fontSize: 7.5, textTransform: "uppercase" }, historyStatusCompletedText: { color: "#34B981" }, historyStatusFailedText: { color: "#E0526D" }, historyRowDelete: { width: 34, height: 34, marginLeft: 4, borderRadius: 10, alignItems: "center", justifyContent: "center" },
+    modalOverlay: { flex: 1, padding: 22, backgroundColor: "rgba(7,5,12,0.68)", alignItems: "center", justifyContent: "center" }, deleteDialog: { width: "100%", maxWidth: 390, padding: 24, borderRadius: 20, borderWidth: 1, borderColor: c.strongBorder, backgroundColor: c.panel, alignItems: "center" }, deleteDialogIcon: { width: 46, height: 46, borderRadius: 23, backgroundColor: "rgba(239,106,127,0.12)", alignItems: "center", justifyContent: "center", marginBottom: 14 }, deleteDialogTitle: { color: c.text, fontFamily: "DMSans_700Bold", fontSize: 18 }, deleteDialogCopy: { color: c.muted, fontFamily: "DMSans_400Regular", fontSize: 12, lineHeight: 18, textAlign: "center", marginTop: 8 }, deleteDialogError: { color: "#EF6A7F", fontFamily: "DMSans_500Medium", fontSize: 11, textAlign: "center", marginTop: 10 }, deleteDialogActions: { width: "100%", flexDirection: "row", gap: 10, marginTop: 22 }, deleteCancelButton: { flex: 1, height: 44, borderRadius: 12, borderWidth: 1, borderColor: c.border, backgroundColor: c.raised, alignItems: "center", justifyContent: "center" }, deleteCancelText: { color: c.body, fontFamily: "DMSans_600SemiBold", fontSize: 12 }, deleteConfirmButton: { flex: 1, height: 44, borderRadius: 12, backgroundColor: "#D94B67", flexDirection: "row", gap: 7, alignItems: "center", justifyContent: "center" }, deleteConfirmText: { color: "white", fontFamily: "DMSans_700Bold", fontSize: 12 },
     mobileNav: { position: "absolute", bottom: 0, left: 0, right: 0, height: Platform.OS === "ios" ? 82 : 68, paddingBottom: Platform.OS === "ios" ? 15 : 3, borderTopWidth: 1, borderTopColor: c.border, backgroundColor: c.header, flexDirection: "row", justifyContent: "space-around", alignItems: "center" }, mobileNavItem: { width: 90, alignItems: "center", gap: 2 }, mobileNavText: { color: c.faint, fontFamily: "DMSans_500Medium", fontSize: 9 }, mobileNavTextActive: { color: c.purpleText },
   });
 }

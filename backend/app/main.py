@@ -27,8 +27,14 @@ async def _preload_diarization(app: FastAPI) -> None:
         logger.exception("Pyannote preload failed; Gemini fallback remains available")
 
 
-async def _resume_interrupted_live_finalizations() -> None:
-    """Resume only persisted live jobs that had reached finalization."""
+async def _recover_interrupted_live_jobs() -> None:
+    """Resume finalization jobs and terminate orphaned recording sessions.
+
+    A live job can remain persisted as ``processing`` when the API process exits
+    before the WebSocket cleanup runs.  There is no microphone connection to
+    resume after startup, so leaving that record active makes clients poll it
+    forever.
+    """
     settings = get_settings()
     recoverable_stages = {
         ProcessingStage.saving_audio,
@@ -36,17 +42,32 @@ async def _resume_interrupted_live_finalizations() -> None:
         ProcessingStage.diarizing,
     }
     for record in await history.list_history():
-        if (
-            record.session_type != SessionType.live
-            or record.status != JobStatus.processing
-            or record.processing_stage not in recoverable_stages
-            or not record.audio_filename
-        ):
+        if record.session_type != SessionType.live or record.status != JobStatus.processing:
             continue
-        path = settings.data_dir / "audio" / record.audio_filename
-        if path.is_file():
+
+        path = (
+            settings.data_dir / "audio" / record.audio_filename
+            if record.audio_filename
+            else None
+        )
+        if (
+            record.processing_stage in recoverable_stages
+            and path is not None
+            and path.is_file()
+        ):
             logger.info("Resuming interrupted live finalization for %s", record.id)
             live._start_background_finalization(record, path)
+            continue
+
+        # ``recording`` (and legacy records with no stage) cannot be resumed:
+        # their WebSocket and any unwritten in-memory PCM disappeared with the
+        # previous process. Move them to a terminal state so the UI can stop
+        # displaying an endless loading indicator.
+        record.status = JobStatus.failed
+        record.processing_stage = None
+        record.error = "Live recording was interrupted before it could be saved"
+        await history.save_record(record)
+        logger.warning("Marked interrupted live recording %s as failed", record.id)
 
 
 @asynccontextmanager
@@ -55,7 +76,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Do not hold FastAPI startup (and the phone's WebSocket connection) while
     # a large model is downloaded or loaded. The warm-up continues in-process.
     preload_task = asyncio.create_task(_preload_diarization(app))
-    await _resume_interrupted_live_finalizations()
+    await _recover_interrupted_live_jobs()
     yield
     if not preload_task.done():
         preload_task.cancel()
