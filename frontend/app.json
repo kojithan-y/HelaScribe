@@ -26,7 +26,8 @@
         }
       ],
       "expo-document-picker",
-      "expo-asset"
+      "expo-asset",
+      "expo-sharing"
     ]
   }
 }
