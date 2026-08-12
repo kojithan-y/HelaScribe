@@ -41,6 +41,7 @@ API routes:
 - `POST /api/meetings/{code}/join` — join with a participant-scoped token
 - `POST /api/meetings/{code}/end` — host-only meeting finalization
 - `GET /api/history` and `GET /api/history/{id}` — job/history polling
+- `POST /api/history/{id}/summary` — generate or return a cached structured Gemini summary
 - `DELETE /api/history/{id}` — remove a history entry
 - `GET /health` — health check
 

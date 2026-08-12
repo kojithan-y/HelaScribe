@@ -1,7 +1,7 @@
 import { File as ExpoFile } from "expo-file-system";
 import { Platform } from "react-native";
 
-import type { Language, MeetingConnection, SessionType, TranscriptRecord } from "./types";
+import type { Language, MeetingConnection, SessionType, TranscriptRecord, TranscriptSummary } from "./types";
 
 export const API_URL = process.env.EXPO_PUBLIC_API_URL ?? "http://localhost:8000/api";
 export const WS_URL = API_URL.replace(/^http/, "ws") + "/live";
@@ -25,6 +25,19 @@ export async function getTranscript(id: string): Promise<TranscriptRecord> {
 export async function deleteTranscript(id: string): Promise<void> {
   const response = await fetch(`${API_URL}/history/${encodeURIComponent(id)}`, { method: "DELETE" });
   if (!response.ok) throw new Error((await response.text()) || "Could not delete transcript");
+}
+
+export async function generateTranscriptSummary(id: string): Promise<TranscriptSummary> {
+  const response = await fetch(`${API_URL}/history/${encodeURIComponent(id)}/summary`, { method: "POST" });
+  if (!response.ok) {
+    let message = "Could not generate summary";
+    try {
+      const body = await response.json();
+      if (typeof body?.detail === "string") message = body.detail;
+    } catch { /* Keep the user-friendly fallback for non-JSON responses. */ }
+    throw new Error(message);
+  }
+  return response.json();
 }
 
 export async function submitAudio(

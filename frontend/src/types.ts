@@ -19,6 +19,25 @@ export interface MeetingParticipant {
   shared_mic: boolean;
 }
 
+export interface SummaryPoint {
+  text: string;
+  start_seconds?: number | null;
+}
+
+export interface SummaryActionItem extends SummaryPoint {
+  assignee?: string | null;
+  due_date?: string | null;
+}
+
+export interface TranscriptSummary {
+  overview: string;
+  key_points: SummaryPoint[];
+  decisions: SummaryPoint[];
+  action_items: SummaryActionItem[];
+  follow_ups: SummaryPoint[];
+  generated_at: string;
+}
+
 export interface TranscriptRecord {
   id: string;
   title: string;
@@ -33,6 +52,8 @@ export interface TranscriptRecord {
   audio_filename?: string | null;
   participant_audio?: Record<string, string>;
   participants?: MeetingParticipant[];
+  summary?: TranscriptSummary | null;
+  summary_source_hash?: string | null;
   error?: string | null;
   created_at: string;
 }

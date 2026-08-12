@@ -62,6 +62,30 @@ class MeetingParticipant(BaseModel):
     shared_mic: bool = False
 
 
+class SummaryPoint(BaseModel):
+    text: str = Field(min_length=1)
+    start_seconds: float | None = Field(default=None, ge=0)
+
+
+class SummaryActionItem(BaseModel):
+    text: str = Field(min_length=1)
+    assignee: str | None = None
+    due_date: str | None = None
+    start_seconds: float | None = Field(default=None, ge=0)
+
+
+class SummaryContent(BaseModel):
+    overview: str = Field(min_length=1)
+    key_points: list[SummaryPoint] = Field(default_factory=list)
+    decisions: list[SummaryPoint] = Field(default_factory=list)
+    action_items: list[SummaryActionItem] = Field(default_factory=list)
+    follow_ups: list[SummaryPoint] = Field(default_factory=list)
+
+
+class TranscriptSummary(SummaryContent):
+    generated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
 class TranscriptRecord(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid4()))
     title: str
@@ -76,6 +100,8 @@ class TranscriptRecord(BaseModel):
     audio_filename: str | None = None
     participant_audio: dict[str, str] = Field(default_factory=dict)
     participants: list[MeetingParticipant] = Field(default_factory=list)
+    summary: TranscriptSummary | None = None
+    summary_source_hash: str | None = None
     error: str | None = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))

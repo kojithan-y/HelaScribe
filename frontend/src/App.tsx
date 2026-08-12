@@ -42,8 +42,8 @@ import {
   useFonts,
 } from "@expo-google-fonts/dm-sans";
 
-import { createMeeting, deleteTranscript, endMeeting, getAudioUrl, getHistory, getTranscript, joinMeeting, submitAudio, WS_URL } from "./api";
-import type { Language, MeetingConnection, ProcessingStage, Segment, SessionType, TranscriptRecord } from "./types";
+import { createMeeting, deleteTranscript, endMeeting, generateTranscriptSummary, getAudioUrl, getHistory, getTranscript, joinMeeting, submitAudio, WS_URL } from "./api";
+import type { Language, MeetingConnection, ProcessingStage, Segment, SessionType, TranscriptRecord, TranscriptSummary } from "./types";
 import type { MeetingClient, MeetingParticipantView } from "./livekitMeeting";
 import { startWebAudioStream, type WebAudioStream } from "./webAudioStream";
 
@@ -121,6 +121,20 @@ function transcriptText(record: TranscriptRecord) {
     .map((segment) => `${segment.speaker ? `${segment.speaker}: ` : ""}${segment.text}`)
     .join("\n")
     .trim();
+}
+
+function summaryText(summary: TranscriptSummary) {
+  const point = (item: { text: string; start_seconds?: number | null }) =>
+    `${item.start_seconds == null ? "" : `[${formatTime(item.start_seconds)}] `}${item.text}`;
+  const sections: string[] = [`OVERVIEW\n${summary.overview}`];
+  if (summary.key_points.length) sections.push(`KEY POINTS\n${summary.key_points.map((item) => `• ${point(item)}`).join("\n")}`);
+  if (summary.decisions.length) sections.push(`DECISIONS\n${summary.decisions.map((item) => `• ${point(item)}`).join("\n")}`);
+  if (summary.action_items.length) sections.push(`ACTION ITEMS\n${summary.action_items.map((item) => {
+    const details = [item.assignee && `Owner: ${item.assignee}`, item.due_date && `Due: ${item.due_date}`].filter(Boolean);
+    return `• ${point(item)}${details.length ? ` (${details.join(" · ")})` : ""}`;
+  }).join("\n")}`);
+  if (summary.follow_ups.length) sections.push(`FOLLOW-UPS\n${summary.follow_ups.map((item) => `• ${point(item)}`).join("\n")}`);
+  return sections.join("\n\n");
 }
 
 function exportFilename(record: TranscriptRecord, extension: string) {
@@ -260,6 +274,93 @@ function AudioPlayback({ recordId, styles }: { recordId: string; styles: AppStyl
   );
 }
 
+function SummaryPanel({
+  record,
+  summarizing,
+  copied,
+  exportBusy,
+  onGenerate,
+  onCopy,
+  onSave,
+  styles,
+}: {
+  record: TranscriptRecord;
+  summarizing: boolean;
+  copied: boolean;
+  exportBusy: boolean;
+  onGenerate?: (record: TranscriptRecord) => void;
+  onCopy?: (summary: TranscriptSummary) => void;
+  onSave?: (record: TranscriptRecord) => void;
+  styles: AppStyles;
+}) {
+  const summary = record.summary;
+  if (!summary) {
+    return (
+      <View style={styles.summaryEmptyCard}>
+        <View style={styles.summaryIcon}><Feather name="zap" size={17} color="#B9A7FF" /></View>
+        <View style={styles.summaryEmptyBody}>
+          <Text style={styles.summaryTitle}>Smart summary</Text>
+          <Text style={styles.summaryHint}>Create grounded key points, decisions, action items and follow-ups.</Text>
+        </View>
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel="Generate smart summary"
+          disabled={summarizing}
+          onPress={() => onGenerate?.(record)}
+          style={[styles.summaryGenerateButton, summarizing && styles.exportButtonDisabled]}
+        >
+          {summarizing ? <ActivityIndicator color="white" size={13} /> : <Feather name="star" size={13} color="white" />}
+          <Text style={styles.summaryGenerateText}>{summarizing ? "Generating…" : "Generate"}</Text>
+        </Pressable>
+      </View>
+    );
+  }
+
+  const sections = [
+    { title: "Key points", items: summary.key_points },
+    { title: "Decisions", items: summary.decisions },
+    { title: "Follow-ups", items: summary.follow_ups },
+  ].filter((section) => section.items.length > 0);
+  return (
+    <View style={styles.summaryCard}>
+      <View style={styles.summaryHeader}>
+        <View style={styles.summaryHeadingRow}><Feather name="zap" size={15} color="#B9A7FF" /><Text style={styles.summaryTitle}>Smart summary</Text></View>
+        <View style={styles.summaryMiniActions}>
+          <Pressable accessibilityRole="button" accessibilityLabel="Copy summary" disabled={exportBusy} onPress={() => onCopy?.(summary)} style={styles.summaryMiniButton}>
+            <Feather name={copied ? "check" : "copy"} size={13} color={copied ? "#34B981" : "#B9A7FF"} />
+          </Pressable>
+          <Pressable accessibilityRole="button" accessibilityLabel="Save summary as text file" disabled={exportBusy} onPress={() => onSave?.(record)} style={styles.summaryMiniButton}>
+            {exportBusy ? <ActivityIndicator color="#B9A7FF" size={12} /> : <Feather name="download" size={13} color="#B9A7FF" />}
+          </Pressable>
+        </View>
+      </View>
+      <Text style={styles.summaryOverview}>{summary.overview}</Text>
+      {sections.map((section) => (
+        <View key={section.title} style={styles.summarySection}>
+          <Text style={styles.summarySectionTitle}>{section.title}</Text>
+          {section.items.map((item, index) => (
+            <View key={`${section.title}-${index}`} style={styles.summaryPointRow}>
+              <View style={styles.summaryBullet} />
+              <Text style={styles.summaryPointText}>{item.start_seconds == null ? "" : `[${formatTime(item.start_seconds)}] `}{item.text}</Text>
+            </View>
+          ))}
+        </View>
+      ))}
+      {summary.action_items.length ? (
+        <View style={styles.summarySection}>
+          <Text style={styles.summarySectionTitle}>Action items</Text>
+          {summary.action_items.map((item, index) => (
+            <View key={`action-${index}`} style={styles.summaryActionItem}>
+              <View style={styles.summaryPointRow}><Feather name="check-square" size={12} color="#9F7AEA" /><Text style={styles.summaryPointText}>{item.start_seconds == null ? "" : `[${formatTime(item.start_seconds)}] `}{item.text}</Text></View>
+              {item.assignee || item.due_date ? <Text style={styles.summaryActionMeta}>{item.assignee ? `Owner: ${item.assignee}` : ""}{item.assignee && item.due_date ? "  ·  " : ""}{item.due_date ? `Due: ${item.due_date}` : ""}</Text> : null}
+            </View>
+          ))}
+        </View>
+      ) : null}
+    </View>
+  );
+}
+
 function TranscriptPanel({
   segments,
   active,
@@ -274,6 +375,11 @@ function TranscriptPanel({
   onCopy,
   onSaveTranscript,
   onSaveAudio,
+  summarizing,
+  summaryCopied,
+  onGenerateSummary,
+  onCopySummary,
+  onSaveSummary,
   styles,
 }: {
   segments: Segment[];
@@ -285,10 +391,15 @@ function TranscriptPanel({
   audioRecordId?: string | null;
   exportRecord?: TranscriptRecord | null;
   copied?: boolean;
-  exportBusy?: "transcript" | "audio" | null;
+  exportBusy?: "transcript" | "audio" | "summary" | null;
   onCopy?: (record: TranscriptRecord) => void;
   onSaveTranscript?: (record: TranscriptRecord) => void;
   onSaveAudio?: (record: TranscriptRecord) => void;
+  summarizing?: boolean;
+  summaryCopied?: boolean;
+  onGenerateSummary?: (record: TranscriptRecord) => void;
+  onCopySummary?: (summary: TranscriptSummary) => void;
+  onSaveSummary?: (record: TranscriptRecord) => void;
   styles: AppStyles;
 }) {
   const isProcessing = !active && (status === "queued" || status === "processing" || Boolean(processingStage));
@@ -373,6 +484,9 @@ function TranscriptPanel({
       ) : null}
 
       <ScrollView style={styles.transcriptScroll} contentContainerStyle={styles.transcriptContent}>
+        {exportRecord?.status === "completed" && transcriptText(exportRecord) ? (
+          <SummaryPanel record={exportRecord} summarizing={Boolean(summarizing)} copied={Boolean(summaryCopied)} exportBusy={exportBusy === "summary"} onGenerate={onGenerateSummary} onCopy={onCopySummary} onSave={onSaveSummary} styles={styles} />
+        ) : null}
         {segments.length === 0 ? (
           <View style={styles.emptyTranscript}>
             <View style={styles.emptyIcon}><MaterialCommunityIcons name="waveform" size={26} color="#8F8A9E" /></View>
@@ -427,7 +541,9 @@ export default function App() {
   const [deleteError, setDeleteError] = useState<string | null>(null);
   const [deletingRecordId, setDeletingRecordId] = useState<string | null>(null);
   const [copiedRecordId, setCopiedRecordId] = useState<string | null>(null);
-  const [exporting, setExporting] = useState<{ id: string; kind: "transcript" | "audio" } | null>(null);
+  const [copiedSummaryRecordId, setCopiedSummaryRecordId] = useState<string | null>(null);
+  const [summarizingRecordId, setSummarizingRecordId] = useState<string | null>(null);
+  const [exporting, setExporting] = useState<{ id: string; kind: "transcript" | "audio" | "summary" } | null>(null);
   const [trackedJobIds, setTrackedJobIds] = useState<string[]>([]);
   const [currentRecordId, setCurrentRecordId] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -534,11 +650,39 @@ export default function App() {
     try {
       const copiedSuccessfully = await Clipboard.setStringAsync(transcriptText(record));
       if (!copiedSuccessfully) throw new Error("Clipboard access was not available");
+      setCopiedSummaryRecordId(null);
       setCopiedRecordId(record.id);
       if (copiedTimerRef.current) clearTimeout(copiedTimerRef.current);
       copiedTimerRef.current = setTimeout(() => setCopiedRecordId(null), 2000);
     } catch (error) {
       Alert.alert("Could not copy", error instanceof Error ? error.message : "Clipboard access failed");
+    }
+  };
+
+  const copySummary = async (recordId: string, summary: TranscriptSummary) => {
+    try {
+      const copiedSuccessfully = await Clipboard.setStringAsync(summaryText(summary));
+      if (!copiedSuccessfully) throw new Error("Clipboard access was not available");
+      setCopiedRecordId(null);
+      setCopiedSummaryRecordId(recordId);
+      if (copiedTimerRef.current) clearTimeout(copiedTimerRef.current);
+      copiedTimerRef.current = setTimeout(() => setCopiedSummaryRecordId(null), 2000);
+    } catch (error) {
+      Alert.alert("Could not copy summary", error instanceof Error ? error.message : "Clipboard access failed");
+    }
+  };
+
+  const generateSummary = async (record: TranscriptRecord) => {
+    if (summarizingRecordId) return;
+    setSummarizingRecordId(record.id);
+    try {
+      const summary = await generateTranscriptSummary(record.id);
+      setHistory((current) => current.map((item) => item.id === record.id ? { ...item, summary } : item));
+      setSelected((current) => current?.id === record.id ? { ...current, summary } : current);
+    } catch (error) {
+      Alert.alert("Could not generate summary", error instanceof Error ? error.message : "Summary generation failed");
+    } finally {
+      setSummarizingRecordId(null);
     }
   };
 
@@ -564,6 +708,33 @@ export default function App() {
       }
     } catch (error) {
       Alert.alert("Could not save transcript", error instanceof Error ? error.message : "Export failed");
+    } finally {
+      setExporting(null);
+    }
+  };
+
+  const saveSummary = async (record: TranscriptRecord) => {
+    if (exporting || !record.summary) return;
+    setExporting({ id: record.id, kind: "summary" });
+    try {
+      const filename = exportFilename(record, "summary.txt");
+      const contents = summaryText(record.summary);
+      if (Platform.OS === "web") {
+        downloadWebFile(new Blob([contents], { type: "text/plain;charset=utf-8" }), filename);
+      } else {
+        const available = await Sharing.isAvailableAsync();
+        if (!available) throw new Error("File sharing is not available on this device");
+        const file = new File(Paths.cache, filename);
+        file.create({ overwrite: true });
+        file.write(contents);
+        await Sharing.shareAsync(file.uri, {
+          dialogTitle: "Save or share summary",
+          mimeType: "text/plain",
+          UTI: "public.plain-text",
+        });
+      }
+    } catch (error) {
+      Alert.alert("Could not save summary", error instanceof Error ? error.message : "Export failed");
     } finally {
       setExporting(null);
     }
@@ -945,7 +1116,7 @@ export default function App() {
                 ) : null}
               </View>
               <Text numberOfLines={2} style={styles.historyDetailTitle}>{selected.title}</Text>
-              <TranscriptPanel segments={displayedSegments} active={false} status={selected.status} processingStage={selected.processing_stage} duration={selected.duration_seconds ?? 0} audioRecordId={selected.audio_filename ? selected.id : null} exportRecord={selected} copied={copiedRecordId === selected.id} exportBusy={exporting?.id === selected.id ? exporting.kind : null} onCopy={(record) => void copyTranscript(record)} onSaveTranscript={(record) => void saveTranscript(record)} onSaveAudio={(record) => void saveAudio(record)} styles={styles} />
+              <TranscriptPanel segments={displayedSegments} active={false} status={selected.status} processingStage={selected.processing_stage} duration={selected.duration_seconds ?? 0} audioRecordId={selected.audio_filename ? selected.id : null} exportRecord={selected} copied={copiedRecordId === selected.id} exportBusy={exporting?.id === selected.id ? exporting.kind : null} onCopy={(record) => void copyTranscript(record)} onSaveTranscript={(record) => void saveTranscript(record)} onSaveAudio={(record) => void saveAudio(record)} summarizing={summarizingRecordId === selected.id} summaryCopied={copiedSummaryRecordId === selected.id} onGenerateSummary={(record) => void generateSummary(record)} onCopySummary={(summary) => void copySummary(selected.id, summary)} onSaveSummary={(record) => void saveSummary(record)} styles={styles} />
             </View>
           ) : (
             <View style={[styles.historyLayout, isWide && styles.historyLayoutWide]}>
@@ -973,7 +1144,7 @@ export default function App() {
                   </Pressable>
                 ))}
               </View>
-              {isWide ? <TranscriptPanel segments={displayedSegments} active={false} status={selected?.status ?? "select one"} processingStage={selected?.processing_stage} duration={selected?.duration_seconds ?? 0} audioRecordId={selected?.audio_filename ? selected.id : null} exportRecord={selected} copied={copiedRecordId === selected?.id} exportBusy={exporting?.id === selected?.id ? exporting?.kind ?? null : null} onCopy={(record) => void copyTranscript(record)} onSaveTranscript={(record) => void saveTranscript(record)} onSaveAudio={(record) => void saveAudio(record)} styles={styles} /> : null}
+              {isWide ? <TranscriptPanel segments={displayedSegments} active={false} status={selected?.status ?? "select one"} processingStage={selected?.processing_stage} duration={selected?.duration_seconds ?? 0} audioRecordId={selected?.audio_filename ? selected.id : null} exportRecord={selected} copied={copiedRecordId === selected?.id} exportBusy={exporting?.id === selected?.id ? exporting?.kind ?? null : null} onCopy={(record) => void copyTranscript(record)} onSaveTranscript={(record) => void saveTranscript(record)} onSaveAudio={(record) => void saveAudio(record)} summarizing={summarizingRecordId === selected?.id} summaryCopied={copiedSummaryRecordId === selected?.id} onGenerateSummary={(record) => void generateSummary(record)} onCopySummary={(summary) => { if (selected) void copySummary(selected.id, summary); }} onSaveSummary={(record) => void saveSummary(record)} styles={styles} /> : null}
             </View>
           )}
         </ScrollView>
@@ -1071,7 +1242,7 @@ export default function App() {
               <View style={styles.privacyRow}><Feather name="shield" size={13} color="#716C7F" /><Text style={styles.privacyText}>Your audio is encrypted in transit and never used to train public models.</Text></View>
             </View>
 
-            <TranscriptPanel segments={segments} active={active} status={status} processingStage={processingStage} duration={shownDuration} intensity={voiceIntensity} audioRecordId={currentExportRecord?.audio_filename ? currentRecordId : null} exportRecord={currentExportRecord} copied={copiedRecordId === currentRecordId} exportBusy={exporting?.id === currentRecordId ? exporting.kind : null} onCopy={(record) => void copyTranscript(record)} onSaveTranscript={(record) => void saveTranscript(record)} onSaveAudio={(record) => void saveAudio(record)} styles={styles} />
+            <TranscriptPanel segments={segments} active={active} status={status} processingStage={processingStage} duration={shownDuration} intensity={voiceIntensity} audioRecordId={currentExportRecord?.audio_filename ? currentRecordId : null} exportRecord={currentExportRecord} copied={copiedRecordId === currentRecordId} exportBusy={exporting?.id === currentRecordId ? exporting.kind : null} onCopy={(record) => void copyTranscript(record)} onSaveTranscript={(record) => void saveTranscript(record)} onSaveAudio={(record) => void saveAudio(record)} summarizing={summarizingRecordId === currentRecordId} summaryCopied={copiedSummaryRecordId === currentRecordId} onGenerateSummary={(record) => void generateSummary(record)} onCopySummary={(summary) => { if (currentRecordId) void copySummary(currentRecordId, summary); }} onSaveSummary={(record) => void saveSummary(record)} styles={styles} />
           </View>
         </ScrollView>
       )}
@@ -1149,6 +1320,8 @@ function createStyles(isDark: boolean) {
     waveform: { height: 78, marginHorizontal: 22, marginTop: 14, paddingHorizontal: 10, borderRadius: 16, borderWidth: 1, borderColor: c.border, backgroundColor: c.raised, flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 3 }, waveBar: { width: 3, borderRadius: 3, backgroundColor: "#9F7AEA" }, timelineRow: { flexDirection: "row", alignItems: "center", gap: 10, paddingHorizontal: 22, paddingTop: 10, paddingBottom: 14 }, timeText: { color: c.faint, fontFamily: "DMSans_500Medium", fontSize: 8 }, timeline: { flex: 1, height: 1, backgroundColor: c.border }, transcriptScroll: { flex: 1, borderTopWidth: 1, borderTopColor: c.border }, transcriptContent: { flexGrow: 1, padding: 22 }, emptyTranscript: { flex: 1, minHeight: 230, alignItems: "center", justifyContent: "center", paddingHorizontal: 32 }, emptyIcon: { width: 55, height: 55, borderRadius: 27.5, backgroundColor: c.raised, alignItems: "center", justifyContent: "center", marginBottom: 14 }, emptyTitle: { color: c.body, fontFamily: "DMSans_600SemiBold", fontSize: 13 }, emptyCopy: { color: c.faint, fontFamily: "DMSans_400Regular", fontSize: 10.5, lineHeight: 16, textAlign: "center", marginTop: 6 }, segmentRow: { flexDirection: "row", marginBottom: 19 }, segmentTime: { width: 42, color: c.faint, fontFamily: "DMSans_500Medium", fontSize: 9, paddingTop: 2 }, speakerLine: { width: 2, borderRadius: 2, marginRight: 12 }, segmentBody: { flex: 1 }, segmentMeta: { flexDirection: "row", alignItems: "center", gap: 7, marginBottom: 4 }, speakerName: { fontFamily: "DMSans_700Bold", fontSize: 9, textTransform: "uppercase", letterSpacing: 0.7 }, languageTag: { color: c.faint, backgroundColor: c.raised, borderRadius: 7, overflow: "hidden", paddingHorizontal: 6, paddingVertical: 2, fontFamily: "DMSans_600SemiBold", fontSize: 7.5, textTransform: "uppercase", letterSpacing: 0.5 }, segmentText: { color: c.body, fontFamily: "DMSans_400Regular", fontSize: 12.5, lineHeight: 19 },
     audioPlayer: { marginHorizontal: 22, marginBottom: 16, flexDirection: "row", alignItems: "center", gap: 10 }, audioPlayButton: { width: 34, height: 34, borderRadius: 17, backgroundColor: "#755BD0", alignItems: "center", justifyContent: "center" }, audioProgressTouch: { flex: 1, height: 30, justifyContent: "center" }, audioProgressTrack: { width: "100%", height: 5, borderRadius: 3, backgroundColor: c.raised }, audioProgressFill: { height: "100%", borderRadius: 3, backgroundColor: "#9F7AEA" }, audioProgressThumb: { position: "absolute", top: -4, width: 13, height: 13, marginLeft: -6.5, borderRadius: 7, borderWidth: 2, borderColor: c.panel, backgroundColor: "#B9A7FF" }, audioTime: { minWidth: 72, color: c.faint, fontFamily: "DMSans_500Medium", fontSize: 8, textAlign: "right" },
     exportActions: { paddingHorizontal: 22, paddingBottom: 16, flexDirection: "row", flexWrap: "wrap", gap: 8 }, exportButton: { minHeight: 38, paddingHorizontal: 12, borderRadius: 11, borderWidth: 1, borderColor: c.strongBorder, backgroundColor: c.purpleSurface, flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 7 }, exportButtonPressed: { opacity: 0.72 }, exportButtonDisabled: { opacity: 0.58 }, exportButtonSuccess: { borderColor: "rgba(52,185,129,0.38)", backgroundColor: "rgba(52,185,129,0.10)" }, exportButtonText: { color: c.purpleText, fontFamily: "DMSans_600SemiBold", fontSize: 10.5 }, exportButtonSuccessText: { color: "#34B981" },
+    summaryEmptyCard: { marginBottom: 20, padding: 14, borderRadius: 14, borderWidth: 1, borderColor: c.strongBorder, backgroundColor: c.purpleSurface, flexDirection: "row", alignItems: "center", gap: 11 }, summaryIcon: { width: 34, height: 34, borderRadius: 10, backgroundColor: c.raised, alignItems: "center", justifyContent: "center" }, summaryEmptyBody: { flex: 1 }, summaryTitle: { color: c.purpleText, fontFamily: "DMSans_700Bold", fontSize: 11.5 }, summaryHint: { color: c.muted, fontFamily: "DMSans_400Regular", fontSize: 9, lineHeight: 13, marginTop: 3 }, summaryGenerateButton: { minHeight: 36, paddingHorizontal: 11, borderRadius: 10, backgroundColor: "#755BD0", flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 6 }, summaryGenerateText: { color: "white", fontFamily: "DMSans_700Bold", fontSize: 9.5 },
+    summaryCard: { marginBottom: 22, padding: 16, borderRadius: 15, borderWidth: 1, borderColor: c.strongBorder, backgroundColor: c.purpleSurface }, summaryHeader: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }, summaryHeadingRow: { flexDirection: "row", alignItems: "center", gap: 7 }, summaryMiniActions: { flexDirection: "row", gap: 6 }, summaryMiniButton: { width: 30, height: 30, borderRadius: 9, borderWidth: 1, borderColor: c.strongBorder, backgroundColor: c.raised, alignItems: "center", justifyContent: "center" }, summaryOverview: { color: c.body, fontFamily: "DMSans_400Regular", fontSize: 11.5, lineHeight: 18 }, summarySection: { marginTop: 15, gap: 7 }, summarySectionTitle: { color: c.purpleText, fontFamily: "DMSans_700Bold", fontSize: 9, letterSpacing: 0.7, textTransform: "uppercase" }, summaryPointRow: { flexDirection: "row", alignItems: "flex-start", gap: 8 }, summaryBullet: { width: 5, height: 5, borderRadius: 3, backgroundColor: "#9F7AEA", marginTop: 6 }, summaryPointText: { flex: 1, color: c.body, fontFamily: "DMSans_400Regular", fontSize: 10.5, lineHeight: 16 }, summaryActionItem: { padding: 10, borderRadius: 10, backgroundColor: c.raised, gap: 5 }, summaryActionMeta: { color: c.faint, fontFamily: "DMSans_500Medium", fontSize: 8.5, marginLeft: 20 },
     processingCard: { marginHorizontal: 22, marginBottom: 16, padding: 14, borderRadius: 13, borderWidth: 1, borderColor: c.strongBorder, backgroundColor: c.purpleSurface, flexDirection: "row", alignItems: "center", gap: 12 }, processingBody: { flex: 1 }, processingTitle: { color: c.purpleText, fontFamily: "DMSans_700Bold", fontSize: 11 }, processingCopy: { color: c.muted, fontFamily: "DMSans_400Regular", fontSize: 9.5, lineHeight: 14, marginTop: 3 },
     historyPage: { paddingHorizontal: 22, paddingTop: 48, paddingBottom: 110 }, historyLayout: { width: "100%", maxWidth: 1180, alignSelf: "center", gap: 22 }, historyLayoutWide: { flexDirection: "row" }, historyList: { flex: 0.85, gap: 9 }, historyDetail: { width: "100%", maxWidth: 760, alignSelf: "center" }, historyDetailActions: { minHeight: 44, flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }, historyBackButton: { minHeight: 40, flexDirection: "row", alignItems: "center", gap: 8 }, historyBackText: { color: c.purpleText, fontFamily: "DMSans_600SemiBold", fontSize: 12 }, historyDeleteButton: { width: 38, height: 38, borderRadius: 11, borderWidth: 1, borderColor: "rgba(239,106,127,0.25)", backgroundColor: "rgba(239,106,127,0.08)", alignItems: "center", justifyContent: "center" }, historyDetailTitle: { color: c.text, fontFamily: "DMSans_700Bold", fontSize: 20, lineHeight: 27, marginBottom: 18 }, historyItem: { minHeight: 75, borderRadius: 14, borderWidth: 1, borderColor: c.border, backgroundColor: c.surface, paddingHorizontal: 14, flexDirection: "row", alignItems: "center" }, historyItemSelected: { borderColor: "#745FC0", backgroundColor: c.selected }, historyIcon: { width: 40, height: 40, borderRadius: 11, backgroundColor: c.purpleSurface, alignItems: "center", justifyContent: "center", marginRight: 12 }, historyBody: { flex: 1 }, historyTitle: { color: c.softText, fontFamily: "DMSans_600SemiBold", fontSize: 12.5 }, historyMeta: { color: c.faint, fontFamily: "DMSans_400Regular", fontSize: 9.5, marginTop: 4 }, historyStatus: { maxWidth: 128, minHeight: 25, paddingHorizontal: 8, borderRadius: 12.5, backgroundColor: c.purpleSurface, flexDirection: "row", alignItems: "center", gap: 5, marginLeft: 8 }, historyStatusCompleted: { backgroundColor: "rgba(52,211,153,0.12)" }, historyStatusFailed: { backgroundColor: "rgba(239,92,117,0.12)" }, historyStatusText: { color: c.purpleText, fontFamily: "DMSans_700Bold", fontSize: 7.5, textTransform: "uppercase" }, historyStatusCompletedText: { color: "#34B981" }, historyStatusFailedText: { color: "#E0526D" }, historyRowDelete: { width: 34, height: 34, marginLeft: 4, borderRadius: 10, alignItems: "center", justifyContent: "center" },
     modalOverlay: { flex: 1, padding: 22, backgroundColor: "rgba(7,5,12,0.68)", alignItems: "center", justifyContent: "center" }, deleteDialog: { width: "100%", maxWidth: 390, padding: 24, borderRadius: 20, borderWidth: 1, borderColor: c.strongBorder, backgroundColor: c.panel, alignItems: "center" }, deleteDialogIcon: { width: 46, height: 46, borderRadius: 23, backgroundColor: "rgba(239,106,127,0.12)", alignItems: "center", justifyContent: "center", marginBottom: 14 }, deleteDialogTitle: { color: c.text, fontFamily: "DMSans_700Bold", fontSize: 18 }, deleteDialogCopy: { color: c.muted, fontFamily: "DMSans_400Regular", fontSize: 12, lineHeight: 18, textAlign: "center", marginTop: 8 }, deleteDialogError: { color: "#EF6A7F", fontFamily: "DMSans_500Medium", fontSize: 11, textAlign: "center", marginTop: 10 }, deleteDialogActions: { width: "100%", flexDirection: "row", gap: 10, marginTop: 22 }, deleteCancelButton: { flex: 1, height: 44, borderRadius: 12, borderWidth: 1, borderColor: c.border, backgroundColor: c.raised, alignItems: "center", justifyContent: "center" }, deleteCancelText: { color: c.body, fontFamily: "DMSans_600SemiBold", fontSize: 12 }, deleteConfirmButton: { flex: 1, height: 44, borderRadius: 12, backgroundColor: "#D94B67", flexDirection: "row", gap: 7, alignItems: "center", justifyContent: "center" }, deleteConfirmText: { color: "white", fontFamily: "DMSans_700Bold", fontSize: 12 },

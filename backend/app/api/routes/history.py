@@ -1,5 +1,7 @@
 import asyncio
+import hashlib
 import json
+import logging
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -7,12 +9,15 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse
 
 from app.core.config import get_settings
-from app.models.schemas import TranscriptRecord
+from app.models.schemas import JobStatus, TranscriptRecord, TranscriptSummary
+from app.services.gemini_service import GeminiService
 
 router = APIRouter(prefix="/history", tags=["history"])
 _records: dict[str, TranscriptRecord] = {}
 _lock = asyncio.Lock()
 _loaded = False
+_summary_locks: dict[str, asyncio.Lock] = {}
+logger = logging.getLogger(__name__)
 
 
 def _history_path() -> Path:
@@ -85,6 +90,63 @@ async def history_audio(record_id: str) -> FileResponse:
     if not path.is_file():
         raise HTTPException(status_code=404, detail="Recorded audio not found")
     return FileResponse(path, filename=path.name)
+
+
+def _summary_source(record: TranscriptRecord) -> tuple[str, str]:
+    if record.segments:
+        lines = [
+            f"[{item.start:.2f}] "
+            f"{f'{item.speaker}: ' if item.speaker else ''}{item.text}"
+            for item in record.segments
+            if item.text
+        ]
+        text = "\n".join(lines)
+    else:
+        text = record.transcript.strip()
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    return text, digest
+
+
+@router.post("/{record_id}/summary", response_model=TranscriptSummary)
+async def generate_summary(record_id: str) -> TranscriptSummary:
+    record = await get_record(record_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="Transcript not found")
+    if record.status != JobStatus.completed:
+        raise HTTPException(status_code=409, detail="Transcript must be completed before summarizing")
+    transcript, source_hash = _summary_source(record)
+    if len(transcript.strip()) < 10:
+        raise HTTPException(status_code=422, detail="Transcript is too short to summarize")
+    if record.summary and record.summary_source_hash == source_hash:
+        return record.summary
+
+    lock = _summary_locks.setdefault(record_id, asyncio.Lock())
+    async with lock:
+        current = await get_record(record_id)
+        if not current:
+            raise HTTPException(status_code=404, detail="Transcript not found")
+        transcript, source_hash = _summary_source(current)
+        if current.summary and current.summary_source_hash == source_hash:
+            return current.summary
+        try:
+            content = await GeminiService().summarize_transcript(transcript, current.language)
+        except Exception as exc:
+            logger.exception("Summary generation failed for %s", record_id)
+            raise HTTPException(
+                status_code=502,
+                detail="Summary generation failed; please try again",
+            ) from exc
+
+        latest = await get_record(record_id)
+        if not latest:
+            raise HTTPException(status_code=404, detail="Transcript not found")
+        _, latest_hash = _summary_source(latest)
+        if latest_hash != source_hash:
+            raise HTTPException(status_code=409, detail="Transcript changed while generating summary")
+        latest.summary = TranscriptSummary(**content.model_dump())
+        latest.summary_source_hash = source_hash
+        await save_record(latest)
+        return latest.summary
 
 
 @router.delete("/{record_id}", status_code=204)
