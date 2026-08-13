@@ -64,6 +64,27 @@ def _can_finalize_from_full_audio(pcm_size: int) -> bool:
     )
 
 
+def _enqueue_latest_preview(
+    queue: asyncio.Queue[tuple[bytes, float, float] | None],
+    item: tuple[bytes, float, float],
+) -> bool:
+    """Keep audio capture responsive when Gemini preview calls fall behind.
+
+    Live previews are provisional and the retained recording receives an
+    authoritative full-audio pass after Stop. Dropping the oldest queued
+    preview is therefore safer than blocking the WebSocket audio receiver.
+    """
+    dropped = False
+    if queue.full():
+        try:
+            queue.get_nowait()
+            dropped = True
+        except asyncio.QueueEmpty:
+            pass
+    queue.put_nowait(item)
+    return dropped
+
+
 def _start_background_finalization(record: TranscriptRecord, path: Path) -> None:
     """Keep a strong reference until background finalization completes."""
     task = asyncio.create_task(_finalize_live(record, path))
@@ -248,6 +269,7 @@ async def live_transcription(websocket: WebSocket) -> None:
         )
         advance_bytes = chunk_bytes - overlap_bytes
         first_chunk = True
+        backlog_warning_sent = False
         max_pcm_bytes = int(settings.max_live_minutes * 60 * start.sample_rate * 2)
         while True:
             message = await websocket.receive()
@@ -264,7 +286,20 @@ async def live_transcription(websocket: WebSocket) -> None:
                     live_chunk = bytes(pending[:chunk_bytes])
                     offset = queued_bytes / (start.sample_rate * 2)
                     commit_after = 0.0 if first_chunk else offset + settings.live_chunk_overlap_seconds
-                    await queue.put((live_chunk, offset, commit_after))
+                    dropped = _enqueue_latest_preview(
+                        queue, (live_chunk, offset, commit_after)
+                    )
+                    if dropped and not backlog_warning_sent:
+                        await websocket.send_json(
+                            {
+                                "type": "warning",
+                                "message": (
+                                    "Live preview is delayed; recording continues and "
+                                    "the complete audio will be transcribed after Stop"
+                                ),
+                            }
+                        )
+                        backlog_warning_sent = True
                     del pending[:advance_bytes]
                     queued_bytes += advance_bytes
                     first_chunk = False

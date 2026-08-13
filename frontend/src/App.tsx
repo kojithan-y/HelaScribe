@@ -991,7 +991,11 @@ export default function App() {
             setActive(true);
             setBusy(false);
           } else if (message.type === "transcript") {
+            setStatus("listening");
             setSegments((current) => [...current, message.segment]);
+          } else if (message.type === "warning") {
+            setStatus("listening - preview delayed");
+            setBusy(false);
           } else if (message.type === "finalizing") {
             trackJob(message.id);
             if (socketRef.current === socket) socketRef.current = null;

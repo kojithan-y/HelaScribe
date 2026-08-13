@@ -86,6 +86,23 @@ def test_preview_queue_is_drained_when_final_pass_is_unavailable(monkeypatch) ->
     assert live._can_finalize_from_full_audio(2_000_000) is False
 
 
+def test_slow_preview_keeps_latest_chunk_without_blocking_audio_capture() -> None:
+    queue: asyncio.Queue[tuple[bytes, float, float] | None] = asyncio.Queue(
+        maxsize=2
+    )
+    first = (b"first", 0.0, 0.0)
+    second = (b"second", 2.5, 3.0)
+    latest = (b"latest", 5.0, 5.5)
+    queue.put_nowait(first)
+    queue.put_nowait(second)
+
+    dropped = live._enqueue_latest_preview(queue, latest)
+
+    assert dropped is True
+    assert queue.get_nowait() == second
+    assert queue.get_nowait() == latest
+
+
 def test_live_chunk_requests_provisional_gemini_speakers(monkeypatch) -> None:
     calls: list[dict] = []
 
@@ -128,6 +145,110 @@ def test_live_chunk_requests_provisional_gemini_speakers(monkeypatch) -> None:
             "request_timeout_seconds": 12.0,
         }
     ]
+
+
+def test_live_chunk_disables_gemini_speakers_when_toggle_is_off(monkeypatch) -> None:
+    calls: list[dict] = []
+
+    class FakeGemini:
+        async def transcribe_file(self, *_args, **kwargs):
+            calls.append(kwargs)
+            return []
+
+    monkeypatch.setattr(
+        live,
+        "get_settings",
+        lambda: SimpleNamespace(
+            gemini_live_model="live-model",
+            gemini_live_timeout_seconds=12.0,
+        ),
+    )
+    record = TranscriptRecord(
+        title="Live test",
+        language=Language.english,
+        session_type=SessionType.live,
+        diarization=False,
+    )
+
+    asyncio.run(
+        live._transcribe_live_chunk(
+            FakeGemini(),
+            b"\x00\x00" * 16_000,
+            16_000,
+            record,
+            0.0,
+        )
+    )
+
+    assert calls[0]["include_speakers"] is False
+
+
+def test_finalize_replaces_gemini_speakers_with_pyannote_when_enabled(
+    monkeypatch,
+) -> None:
+    record = TranscriptRecord(
+        title="Live test",
+        language=Language.english,
+        session_type=SessionType.live,
+        diarization=True,
+        status=JobStatus.processing,
+        segments=[
+            TranscriptSegment(start=0, end=1, text="hello", speaker="SPEAKER_00"),
+            TranscriptSegment(start=1, end=2, text="there", speaker="SPEAKER_00"),
+        ],
+    )
+
+    async def fake_diarization(_path: str):
+        return [
+            TranscriptSegment(start=0, end=1, text="", speaker="SPEAKER_00"),
+            TranscriptSegment(start=1, end=2, text="", speaker="SPEAKER_01"),
+        ]
+
+    async def ignore_save(saved: TranscriptRecord):
+        return saved
+
+    monkeypatch.setattr(live, "diarize_file", fake_diarization)
+    monkeypatch.setattr(live, "save_record", ignore_save)
+    monkeypatch.setattr(
+        live,
+        "get_settings",
+        lambda: SimpleNamespace(live_finalize_full_audio=False),
+    )
+
+    asyncio.run(live._finalize_live(record, Path("unused.wav")))
+
+    assert [item.speaker for item in record.segments] == ["SPEAKER_00", "SPEAKER_01"]
+    assert record.transcript == "SPEAKER_00: hello\nSPEAKER_01: there"
+
+
+def test_finalize_skips_pyannote_when_toggle_is_off(monkeypatch) -> None:
+    record = TranscriptRecord(
+        title="Live test",
+        language=Language.english,
+        session_type=SessionType.live,
+        diarization=False,
+        status=JobStatus.processing,
+        segments=[TranscriptSegment(start=0, end=1, text="hello")],
+    )
+
+    async def unexpected_diarization(_path: str):
+        raise AssertionError("Pyannote must not run when diarization is disabled")
+
+    async def ignore_save(saved: TranscriptRecord):
+        return saved
+
+    monkeypatch.setattr(live, "diarize_file", unexpected_diarization)
+    monkeypatch.setattr(live, "save_record", ignore_save)
+    monkeypatch.setattr(
+        live,
+        "get_settings",
+        lambda: SimpleNamespace(live_finalize_full_audio=False),
+    )
+
+    asyncio.run(live._finalize_live(record, Path("unused.wav")))
+
+    assert record.status == JobStatus.completed
+    assert record.transcript == "hello"
 
 
 def test_finalize_preserves_transcript_when_diarization_fails(monkeypatch) -> None:
