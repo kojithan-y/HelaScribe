@@ -614,7 +614,7 @@ export default function App() {
   const { width, height } = useWindowDimensions();
   const systemScheme = useColorScheme();
   const [isDark, setIsDark] = useState(systemScheme !== "light");
-  const styles = useMemo(() => createStyles(isDark), [isDark]);
+  const styles = useMemo(() => createStyles(isDark, width), [isDark, width]);
   const isWide = width >= 900;
   const [tab, setTab] = useState<"new" | "history">("new");
   const [language, setLanguage] = useState<Language>("Sinhala");
@@ -1326,7 +1326,7 @@ export default function App() {
                 <SectionTitle number="01" title="Choose your language" styles={styles} />
                 <View style={styles.languageGrid}>
                   {LANGUAGES.map((item) => (
-                    <Pressable key={item.value} disabled={active || busy} onPress={() => setLanguage(item.value)} style={[styles.languagePill, language === item.value && styles.languagePillActive]}>
+                    <Pressable key={item.value} accessibilityRole="radio" accessibilityLabel={item.value} accessibilityState={{ checked: language === item.value, disabled: active || busy }} disabled={active || busy} onPress={() => setLanguage(item.value)} style={({ pressed }) => [styles.languagePill, language === item.value && styles.languagePillActive, (active || busy) && { opacity: 0.55 }, pressed && { opacity: 0.8 }]}>
                       <Text style={[styles.languageNative, language === item.value && styles.languageNativeActive]}>{item.native}</Text>
                       {item.value !== item.native ? <Text style={styles.languageEnglish}>{item.value}</Text> : null}
                       {language === item.value ? <View style={styles.checkDot}><Feather name="check" size={10} color="#17131F" /></View> : null}
@@ -1339,7 +1339,7 @@ export default function App() {
                 <SectionTitle number="02" title="How would you like to begin?" styles={styles} />
                 <View style={[styles.sessionGrid, !isWide && width < 540 && styles.sessionGridStack]}>
                   {SESSION_TYPES.map((item) => (
-                    <Pressable key={item.value} disabled={active || busy} onPress={() => setSessionType(item.value)} style={[styles.sessionCard, sessionType === item.value && styles.sessionCardActive]}>
+                    <Pressable key={item.value} accessibilityRole="radio" accessibilityLabel={`${item.label}. ${item.hint}`} accessibilityState={{ checked: sessionType === item.value, disabled: active || busy }} disabled={active || busy} onPress={() => setSessionType(item.value)} style={({ pressed }) => [styles.sessionCard, sessionType === item.value && styles.sessionCardActive, (active || busy) && { opacity: 0.55 }, pressed && { opacity: 0.8 }]}>
                       <View style={[styles.sessionIcon, sessionType === item.value && styles.sessionIconActive]}><Feather name={item.icon} size={20} color={sessionType === item.value ? "white" : "#9A95A8"} /></View>
                       <Text style={[styles.sessionLabel, sessionType === item.value && styles.sessionLabelActive]}>{item.label}</Text>
                       <Text style={styles.sessionHint}>{item.hint}</Text>
@@ -1454,20 +1454,21 @@ export default function App() {
   );
 }
 
-function createStyles(isDark: boolean) {
+function createStyles(isDark: boolean, width: number) {
+  const compact = width < 540;
   const c = isDark ? {
     bg: "#100E14", header: "rgba(16,14,20,0.92)", surface: "#1A181E", panel: "#18161C",
     raised: "#25222B", selected: "#2A2338", border: "#302C38", strongBorder: "#4B4262",
-    text: "#F5F2FA", softText: "#D8D4DF", body: "#C2BEC9", muted: "#8F8A9E", faint: "#716C7B",
+    text: "#F5F2FA", softText: "#E5E1ED", body: "#D0CBD9", muted: "#ABA4B9", faint: "#A39BAF",
     purpleText: "#D8CDF8", purpleSurface: "#282231", glowOne: "rgba(100,70,170,0.10)", glowTwo: "rgba(83,53,130,0.08)",
   } : {
     bg: "#F7F4FB", header: "rgba(255,255,255,0.94)", surface: "#FFFFFF", panel: "#FFFFFF",
     raised: "#EEE9F4", selected: "#EAE2F7", border: "#DDD6E6", strongBorder: "#C4B5D8",
-    text: "#241D2D", softText: "#42394D", body: "#5E5668", muted: "#766E80", faint: "#91899A",
+    text: "#241D2D", softText: "#42394D", body: "#51475E", muted: "#6E637B", faint: "#71657E",
     purpleText: "#62499A", purpleSurface: "#EEE7F8", glowOne: "rgba(132,94,210,0.12)", glowTwo: "rgba(160,122,220,0.09)",
   };
 
-  return StyleSheet.create({
+  const base = StyleSheet.create({
     app: { flex: 1, backgroundColor: c.bg, overflow: "hidden" }, loading: { flex: 1, backgroundColor: c.bg, alignItems: "center", justifyContent: "center" },
     glowOne: { position: "absolute", width: 450, height: 450, borderRadius: 225, backgroundColor: c.glowOne, top: -260, left: -160 },
     glowTwo: { position: "absolute", width: 500, height: 500, borderRadius: 250, backgroundColor: c.glowTwo, bottom: -350, right: -200 },
@@ -1493,5 +1494,69 @@ function createStyles(isDark: boolean) {
     modalOverlay: { flex: 1, padding: 22, backgroundColor: "rgba(7,5,12,0.68)", alignItems: "center", justifyContent: "center" }, deleteDialog: { width: "100%", maxWidth: 390, padding: 24, borderRadius: 20, borderWidth: 1, borderColor: c.strongBorder, backgroundColor: c.panel, alignItems: "center" }, deleteDialogIcon: { width: 46, height: 46, borderRadius: 23, backgroundColor: "rgba(239,106,127,0.12)", alignItems: "center", justifyContent: "center", marginBottom: 14 }, deleteDialogTitle: { color: c.text, fontFamily: "DMSans_700Bold", fontSize: 18 }, deleteDialogCopy: { color: c.muted, fontFamily: "DMSans_400Regular", fontSize: 12, lineHeight: 18, textAlign: "center", marginTop: 8 }, deleteDialogError: { color: "#EF6A7F", fontFamily: "DMSans_500Medium", fontSize: 11, textAlign: "center", marginTop: 10 }, deleteDialogActions: { width: "100%", flexDirection: "row", gap: 10, marginTop: 22 }, deleteCancelButton: { flex: 1, height: 44, borderRadius: 12, borderWidth: 1, borderColor: c.border, backgroundColor: c.raised, alignItems: "center", justifyContent: "center" }, deleteCancelText: { color: c.body, fontFamily: "DMSans_600SemiBold", fontSize: 12 }, deleteConfirmButton: { flex: 1, height: 44, borderRadius: 12, backgroundColor: "#D94B67", flexDirection: "row", gap: 7, alignItems: "center", justifyContent: "center" }, deleteConfirmText: { color: "white", fontFamily: "DMSans_700Bold", fontSize: 12 },
     historyFilters: { gap: 10, marginBottom: 4, padding: 13, borderRadius: 16, borderWidth: 1, borderColor: c.border, backgroundColor: c.surface }, historyFilterHeader: { flexDirection: "row", alignItems: "center", justifyContent: "space-between" }, historyFilterTitle: { color: c.softText, fontFamily: "DMSans_700Bold", fontSize: 13 }, historyFilterCount: { color: c.faint, fontFamily: "DMSans_400Regular", fontSize: 9, marginTop: 2 }, historyClearButton: { minHeight: 29, paddingHorizontal: 9, borderRadius: 9, borderWidth: 1, borderColor: c.strongBorder, backgroundColor: c.purpleSurface, flexDirection: "row", alignItems: "center", gap: 4 }, historyClearText: { color: c.purpleText, fontFamily: "DMSans_600SemiBold", fontSize: 9 }, historySearchBox: { height: 47, paddingHorizontal: 7, borderRadius: 13, borderWidth: 1, borderColor: c.strongBorder, backgroundColor: c.raised, flexDirection: "row", alignItems: "center", gap: 8 }, historySearchIcon: { width: 32, height: 32, borderRadius: 9, backgroundColor: c.purpleSurface, alignItems: "center", justifyContent: "center" }, historySearchReset: { width: 30, height: 30, borderRadius: 9, alignItems: "center", justifyContent: "center" }, historySearchInput: { flex: 1, color: c.body, fontFamily: "DMSans_400Regular", fontSize: 11.5, paddingVertical: 0, outlineWidth: 0 }, historyFilterPills: { gap: 7 }, historyFilterPill: { minHeight: 29, paddingHorizontal: 11, borderRadius: 10, borderWidth: 1, borderColor: "transparent", backgroundColor: c.raised, alignItems: "center", justifyContent: "center" }, historyFilterPillActive: { borderColor: "#8B70DC", backgroundColor: "#755BD0" }, historyFilterText: { color: c.muted, fontFamily: "DMSans_600SemiBold", fontSize: 9 }, historyFilterTextActive: { color: "white" },
     mobileNav: { position: "absolute", bottom: 0, left: 0, right: 0, height: Platform.OS === "ios" ? 82 : 68, paddingBottom: Platform.OS === "ios" ? 15 : 3, borderTopWidth: 1, borderTopColor: c.border, backgroundColor: c.header, flexDirection: "row", justifyContent: "space-around", alignItems: "center" }, mobileNavItem: { width: 90, alignItems: "center", gap: 2 }, mobileNavText: { color: c.faint, fontFamily: "DMSans_500Medium", fontSize: 9 }, mobileNavTextActive: { color: c.purpleText },
+  });
+
+  // Keep small supporting labels legible across web and native screens.
+  const readable = Object.fromEntries(Object.entries(base).map(([key, value]) => {
+    const style = value as typeof value & { fontSize?: number; lineHeight?: number };
+    return [key, style.fontSize == null ? style : {
+      ...style,
+      fontSize: Math.max(11, style.fontSize),
+      ...(style.lineHeight == null ? {} : { lineHeight: Math.max(17, style.lineHeight) }),
+    }];
+  })) as typeof base;
+
+  return StyleSheet.create({
+    ...readable,
+    header: { ...base.header, paddingHorizontal: compact ? 18 : 32 },
+    brandTagline: { ...base.brandTagline, fontSize: 9, letterSpacing: 1 },
+    themeButton: { ...base.themeButton, width: 44, height: 44, borderRadius: 14 },
+    mainScroll: { ...base.mainScroll, paddingHorizontal: compact ? 18 : 32, paddingTop: compact ? 28 : 44 },
+    pageIntro: { ...base.pageIntro, marginBottom: 30 },
+    heroTitle: { ...base.heroTitle, fontSize: compact ? 30 : 40, lineHeight: compact ? 38 : 49 },
+    heroCopy: { ...base.heroCopy, fontSize: 15, lineHeight: 23, maxWidth: 540 },
+    workspace: { ...base.workspace, gap: 28 },
+    controlsColumn: { ...base.controlsColumn, minWidth: 0, gap: 24 },
+    sectionHeading: { ...base.sectionHeading, flexShrink: 1, fontSize: 15 },
+    languagePill: { ...base.languagePill, flexGrow: 1, minWidth: compact ? "45%" : 105, minHeight: 68, height: "auto", paddingVertical: 13 },
+    languageNative: { ...base.languageNative, fontSize: 15 },
+    languageEnglish: { ...base.languageEnglish, fontSize: 11 },
+    sessionGrid: { ...base.sessionGrid, flexWrap: "wrap", gap: 12 },
+    sessionGridStack: { flexDirection: "row", flexWrap: "wrap" },
+    sessionCard: { ...base.sessionCard, flexBasis: "45%", flexGrow: 1, minHeight: 128, padding: 16 },
+    sessionLabel: { ...base.sessionLabel, fontSize: 15 },
+    sessionHint: { ...base.sessionHint, fontSize: 12, lineHeight: 18, marginTop: 5 },
+    toggleCard: { ...base.toggleCard, padding: 16, gap: 4 },
+    toggleTitle: { ...base.toggleTitle, fontSize: 14 },
+    toggleHint: { ...base.toggleHint, fontSize: 12, lineHeight: 18 },
+    primaryButton: { ...base.primaryButton, height: 58 },
+    primaryText: { ...base.primaryText, fontSize: 16 },
+    privacyRow: { ...base.privacyRow, alignItems: "flex-start", paddingHorizontal: 8 },
+    privacyText: { ...base.privacyText, flexShrink: 1, fontSize: 11, lineHeight: 17 },
+    transcriptCard: { ...base.transcriptCard, minWidth: 0, minHeight: compact ? 480 : 620 },
+    transcriptHeader: { ...base.transcriptHeader, paddingHorizontal: compact ? 16 : 24, gap: 10 },
+    panelTitle: { ...base.panelTitle, fontSize: 18 },
+    transcriptContent: { ...base.transcriptContent, padding: compact ? 16 : 24 },
+    segmentText: { ...base.segmentText, fontSize: 15, lineHeight: 25 },
+    segmentMeta: { ...base.segmentMeta, flexWrap: "wrap" },
+    emptyTitle: { ...base.emptyTitle, fontSize: 16, textAlign: "center" },
+    emptyCopy: { ...base.emptyCopy, fontSize: 13, lineHeight: 21 },
+    exportButton: { ...base.exportButton, minHeight: 44 },
+    audioPlayButton: { ...base.audioPlayButton, width: 44, height: 44, borderRadius: 22 },
+    summaryEmptyCard: { ...base.summaryEmptyCard, flexWrap: "wrap" },
+    summaryGenerateButton: { ...base.summaryGenerateButton, minHeight: 44 },
+    summaryOverview: { ...base.summaryOverview, fontSize: 14, lineHeight: 23 },
+    summaryPointText: { ...base.summaryPointText, fontSize: 13, lineHeight: 21 },
+    historyPage: { ...base.historyPage, paddingHorizontal: compact ? 16 : 32, paddingTop: 28 },
+    historyFilters: { ...base.historyFilters, padding: 16, gap: 14 },
+    historyFilterTitle: { ...base.historyFilterTitle, fontSize: 20 },
+    historyFilterPill: { ...base.historyFilterPill, minHeight: 38 },
+    historyItem: { ...base.historyItem, minHeight: 90, paddingHorizontal: compact ? 10 : 16 },
+    historyTitle: { ...base.historyTitle, fontSize: 14 },
+    historyIcon: { ...base.historyIcon, marginRight: compact ? 8 : 12 },
+    historyStatus: { ...base.historyStatus, maxWidth: compact ? 76 : 128 },
+    historyMetaRow: { ...base.historyMetaRow, flexWrap: "wrap", gap: 4 },
+    historyRowDelete: { ...base.historyRowDelete, width: 40, height: 44 },
+    mobileNavItem: { ...base.mobileNavItem, minHeight: 48, justifyContent: "center", gap: 4 },
   });
 }
