@@ -35,7 +35,9 @@ LANGUAGE_GUIDANCE = {
         "The audio may switch between Sinhala, Tamil, and English. Transcribe all three, "
         "preserve each in its native script, and never translate. For every utterance set "
         "detected_language to Sinhala, Tamil, English, or Unknown. Split an utterance when "
-        "the spoken language changes."
+        "the spoken language changes. English speech must remain in Latin script; do not "
+        "write English words using Sinhala or Tamil characters. Sinhala speech must remain "
+        "in Sinhala script, and Tamil speech must remain in Tamil script."
     ),
 }
 
@@ -104,6 +106,25 @@ def bound_segments_to_duration(
     return bounded
 
 
+def _is_transcription_model(model: str) -> bool:
+    return "transcribe" in model.lower()
+
+
+def _plain_transcription_segment(
+    text: str, duration_seconds: float | None
+) -> list[TranscriptSegment]:
+    cleaned = text.strip()
+    if not cleaned or cleaned.upper() in {"EMPTY", "NO SPEECH", "NO SPEECH DETECTED"}:
+        return []
+    return [
+        TranscriptSegment(
+            start=0.0,
+            end=max(duration_seconds or 0.0, 0.001),
+            text=cleaned,
+        )
+    ]
+
+
 class GeminiService:
     def __init__(self) -> None:
         settings = get_settings()
@@ -127,6 +148,7 @@ class GeminiService:
         include_speakers: bool = False,
         audio_duration_seconds: float | None = None,
         request_timeout_seconds: float | None = None,
+        translate_to: Language | None = None,
     ) -> list[TranscriptSegment]:
         speaker_guidance = (
             "Assign stable anonymous labels SPEAKER_00, SPEAKER_01, and so on to "
@@ -145,21 +167,41 @@ class GeminiService:
             f"{speaker_guidance} "
             "Use seconds relative to the start of this audio clip for start and end."
         )
+        if translate_to:
+            prompt += (
+                f" For every segment, translated_text is REQUIRED and must be written in "
+                f"{translate_to.value}. "
+                "Translate the spoken meaning faithfully, including when the source is "
+                "Sinhala, Tamil, English, or mixed. If the source is already Tamil, copy "
+                "the original text into translated_text. Never leave translated_text empty "
+                "and never replace the original text."
+            )
         timeout_seconds = request_timeout_seconds or self.settings.gemini_batch_timeout_seconds
+        selected_model = model or self.settings.gemini_batch_model
+        transcribe_model = _is_transcription_model(selected_model)
+        if transcribe_model:
+            prompt += (
+                " Return only the transcript text, without markdown, JSON, timestamps, "
+                "or commentary. If there is no intelligible speech, return EMPTY."
+            )
         for attempt in range(self.settings.gemini_max_retries + 1):
             try:
                 response = await asyncio.wait_for(
                     self.client.aio.models.generate_content(
-                        model=model or self.settings.gemini_batch_model,
+                        model=selected_model,
                         contents=[
                             types.Part.from_bytes(data=audio, mime_type=mime_type),
                             types.Part.from_text(text=prompt),
                         ],
-                        config=types.GenerateContentConfig(
-                            temperature=0.0,
-                            audio_timestamp=True,
-                            response_mime_type="application/json",
-                            response_schema=GeminiTranscript,
+                        config=(
+                            types.GenerateContentConfig(temperature=0.0)
+                            if transcribe_model
+                            else types.GenerateContentConfig(
+                                temperature=0.0,
+                                audio_timestamp=True,
+                                response_mime_type="application/json",
+                                response_schema=GeminiTranscript,
+                            )
                         ),
                     ),
                     timeout=timeout_seconds,
@@ -178,7 +220,11 @@ class GeminiService:
                 await asyncio.sleep(
                     self.settings.gemini_retry_base_seconds * (2**attempt)
                 )
-        if getattr(response, "parsed", None):
+        if transcribe_model:
+            segments = _plain_transcription_segment(
+                response.text or "", audio_duration_seconds
+            )
+        elif getattr(response, "parsed", None):
             parsed = response.parsed
             if isinstance(parsed, GeminiTranscript):
                 segments = parsed.segments
@@ -230,7 +276,7 @@ class GeminiService:
         }
         response = await asyncio.wait_for(
             self.client.aio.models.generate_content(
-                model=self.settings.gemini_batch_model,
+                model=self.settings.gemini_text_model,
                 contents=[types.Part.from_text(text=prompt)],
                 config=types.GenerateContentConfig(
                     temperature=0.0,
@@ -275,7 +321,7 @@ class GeminiService:
             try:
                 response = await asyncio.wait_for(
                     self.client.aio.models.generate_content(
-                        model=self.settings.gemini_batch_model,
+                        model=self.settings.gemini_text_model,
                         contents=[types.Part.from_text(text=prompt)],
                         config=types.GenerateContentConfig(
                             temperature=0.1,

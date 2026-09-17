@@ -100,15 +100,20 @@ async def _transcribe_live_chunk(
     offset: float,
 ) -> list[TranscriptSegment]:
     settings = get_settings()
+    request = {
+        "model": settings.gemini_live_model,
+        "timestamp_offset": offset,
+        "include_speakers": record.diarization,
+        "audio_duration_seconds": len(chunk) / (sample_rate * 2),
+        "request_timeout_seconds": settings.gemini_live_timeout_seconds,
+    }
+    if getattr(settings, "auto_translate", False):
+        request["translate_to"] = settings.target_language
     return await gemini.transcribe_file(
         _pcm_wav_bytes(chunk, sample_rate),
         "audio/wav",
         record.language,
-        model=settings.gemini_live_model,
-        timestamp_offset=offset,
-        include_speakers=record.diarization,
-        audio_duration_seconds=len(chunk) / (sample_rate * 2),
-        request_timeout_seconds=settings.gemini_live_timeout_seconds,
+        **request,
     )
 
 
@@ -143,6 +148,19 @@ async def _finalize_live(record: TranscriptRecord, path: Path) -> None:
                         include_speakers=record.diarization,
                         audio_duration_seconds=record.duration_seconds,
                     )
+                    if settings.auto_translate and record.segments and any(
+                        not item.translated_text for item in record.segments
+                    ):
+                        final_gemini = GeminiService()
+                        translations = await final_gemini.translate_segments(
+                            record.segments, settings.target_language
+                        )
+                        record.segments = [
+                            item.model_copy(update={"translated_text": translated})
+                            for item, translated in zip(
+                                record.segments, translations, strict=True
+                            )
+                        ]
                     record.error = None
                 else:
                     record.error = (
@@ -192,13 +210,13 @@ async def live_transcription(websocket: WebSocket) -> None:
     raw_path: Path | None = None
     raw_file = None
     stopped = False
-    worker: asyncio.Task | None = None
+    workers: list[asyncio.Task[None]] = []
     try:
         start = LiveStart.model_validate(await websocket.receive_json())
         record = TranscriptRecord(
             title=start.title,
             language=start.language,
-            session_type=SessionType.live,
+            session_type=start.session_type,
             diarization=start.diarization,
             status=JobStatus.processing,
             processing_stage=ProcessingStage.recording,
@@ -237,6 +255,16 @@ async def live_transcription(websocket: WebSocket) -> None:
                         record,
                         offset,
                     )
+                    if settings.auto_translate and segments and any(
+                        not item.translated_text for item in segments
+                    ):
+                        translations = await gemini.translate_segments(
+                            segments, settings.target_language
+                        )
+                        segments = [
+                            item.model_copy(update={"translated_text": translated})
+                            for item, translated in zip(segments, translations, strict=True)
+                        ]
                 except Exception as exc:
                     # A transient Gemini/quota failure must not terminate the
                     # microphone WebSocket. The final full-audio pass can fill
@@ -261,7 +289,10 @@ async def live_transcription(websocket: WebSocket) -> None:
                         {"type": "transcript", "segment": segment.model_dump()}
                     )
 
-        worker = asyncio.create_task(transcribe_chunks())
+        workers = [
+            asyncio.create_task(transcribe_chunks())
+            for _ in range(2)
+        ]
         queued_bytes = 0
         overlap_bytes = min(
             chunk_bytes // 2,
@@ -269,7 +300,6 @@ async def live_transcription(websocket: WebSocket) -> None:
         )
         advance_bytes = chunk_bytes - overlap_bytes
         first_chunk = True
-        backlog_warning_sent = False
         max_pcm_bytes = int(settings.max_live_minutes * 60 * start.sample_rate * 2)
         while True:
             message = await websocket.receive()
@@ -286,20 +316,9 @@ async def live_transcription(websocket: WebSocket) -> None:
                     live_chunk = bytes(pending[:chunk_bytes])
                     offset = queued_bytes / (start.sample_rate * 2)
                     commit_after = 0.0 if first_chunk else offset + settings.live_chunk_overlap_seconds
-                    dropped = _enqueue_latest_preview(
-                        queue, (live_chunk, offset, commit_after)
-                    )
-                    if dropped and not backlog_warning_sent:
-                        await websocket.send_json(
-                            {
-                                "type": "warning",
-                                "message": (
-                                    "Live preview is delayed; recording continues and "
-                                    "the complete audio will be transcribed after Stop"
-                                ),
-                            }
-                        )
-                        backlog_warning_sent = True
+                    # Keep every chunk so slow model responses cannot create
+                    # permanent gaps in the live timeline.
+                    await queue.put((live_chunk, offset, commit_after))
                     del pending[:advance_bytes]
                     queued_bytes += advance_bytes
                     first_chunk = False
@@ -312,16 +331,17 @@ async def live_transcription(websocket: WebSocket) -> None:
                     pending.clear()
                     while not queue.empty():
                         queue.get_nowait()
-                    await queue.put(None)
+                    for _ in workers:
+                        await queue.put(None)
                     try:
                         await asyncio.wait_for(
-                            asyncio.shield(worker),
+                            asyncio.shield(asyncio.gather(*workers)),
                             timeout=settings.live_stop_preview_grace_seconds,
                         )
                     except TimeoutError:
-                        worker.cancel()
-                        with suppress(asyncio.CancelledError):
-                            await worker
+                        for task in workers:
+                            task.cancel()
+                        await asyncio.gather(*workers, return_exceptions=True)
                 else:
                     # Preserve the old drain behavior when the full pass is
                     # disabled or the recording is too large for inline input.
@@ -331,8 +351,9 @@ async def live_transcription(websocket: WebSocket) -> None:
                         await queue.put((bytes(pending), offset, commit_after))
                         queued_bytes += len(pending)
                         pending.clear()
-                    await queue.put(None)
-                    await worker
+                    for _ in workers:
+                        await queue.put(None)
+                    await asyncio.gather(*workers)
                 break
 
         path = settings.data_dir / "audio" / record.audio_filename
@@ -367,8 +388,11 @@ async def live_transcription(websocket: WebSocket) -> None:
         if raw_path and raw_path.exists():
             with suppress(OSError):
                 raw_path.unlink()
-        if worker and not worker.done():
-            worker.cancel()
+        for task in workers:
+            if not task.done():
+                task.cancel()
+        if workers:
+            await asyncio.gather(*workers, return_exceptions=True)
         if record and not stopped and record.status == JobStatus.processing:
             record.status = JobStatus.failed
             record.processing_stage = None
