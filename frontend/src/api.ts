@@ -7,10 +7,6 @@ export const API_URL = process.env.EXPO_PUBLIC_API_URL ?? "http://localhost:8000
 export const WS_URL = API_URL.replace(/^http/, "ws") + "/live";
 export const HISTORY_WS_URL = API_URL.replace(/^http/, "ws") + "/history/events";
 
-export function getAudioUrl(id: string): string {
-  return `${API_URL}/history/${encodeURIComponent(id)}/audio`;
-}
-
 export async function getHistory(): Promise<TranscriptRecord[]> {
   const response = await fetch(`${API_URL}/history`);
   if (!response.ok) throw new Error("Could not load transcript history");
