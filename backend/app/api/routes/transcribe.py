@@ -114,13 +114,32 @@ async def _process(record: TranscriptRecord, path: Path, mime_type: str) -> None
         if energy is not None and energy < get_settings().live_silence_rms_threshold:
             transcript = []
         else:
+            diarization_task = (
+                asyncio.create_task(diarize_file(str(path)))
+                if record.diarization
+                else None
+            )
             transcript = await gemini.transcribe_file(
                 audio,
                 mime_type,
-                record.language,
+                Language.mixed,
                 include_speakers=record.diarization,
                 audio_duration_seconds=known_duration,
+                translate_to=get_settings().target_language
+                if get_settings().auto_translate
+                else None,
             )
+            settings = get_settings()
+            if settings.auto_translate and transcript and any(
+                not item.translated_text for item in transcript
+            ):
+                translations = await gemini.translate_segments(
+                    transcript, settings.target_language
+                )
+                transcript = [
+                    item.model_copy(update={"translated_text": translated})
+                    for item, translated in zip(transcript, translations, strict=True)
+                ]
         record.segments = transcript
         if record.diarization and transcript:
             record.processing_stage = ProcessingStage.diarizing
@@ -128,7 +147,7 @@ async def _process(record: TranscriptRecord, path: Path, mime_type: str) -> None
             try:
                 # Local inference refines Gemini's fallback labels only after
                 # the authoritative transcript is complete.
-                speakers = await diarize_file(str(path))
+                speakers = await diarization_task if diarization_task else []
                 record.segments = merge_transcript_and_speakers(transcript, speakers)
             except Exception as exc:
                 record.segments = transcript

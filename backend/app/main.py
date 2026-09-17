@@ -102,8 +102,8 @@ async def _recover_file_jobs() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.diarization_ready = False
-    # Do not hold FastAPI startup (and the phone's WebSocket connection) while
-    # a large model is downloaded or loaded. The warm-up continues in-process.
+    # Warm the optional model in the background. API and WebSocket handshakes
+    # must remain available while a large checkpoint is downloading/loading.
     preload_task = asyncio.create_task(_preload_diarization(app))
     await _recover_interrupted_live_jobs()
     await _recover_file_jobs()
