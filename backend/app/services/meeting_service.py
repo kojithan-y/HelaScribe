@@ -441,6 +441,9 @@ class MeetingSession:
                     model=settings.gemini_batch_model,
                     include_speakers=state.shared_mic,
                     audio_duration_seconds=state.duration,
+                    translate_to=settings.target_language
+                    if settings.auto_translate
+                    else None,
                 )
             if state.shared_mic and final:
                 self.record.processing_stage = ProcessingStage.diarizing

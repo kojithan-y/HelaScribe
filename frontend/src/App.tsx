@@ -15,7 +15,6 @@ import {
   View,
   useColorScheme,
   useWindowDimensions,
-  type GestureResponderEvent,
 } from "react-native";
 import { StatusBar } from "expo-status-bar";
 import { LinearGradient } from "expo-linear-gradient";
@@ -25,12 +24,7 @@ import { File, Paths } from "expo-file-system";
 import * as Sharing from "expo-sharing";
 import {
   AudioModule,
-  RecordingPresets,
   setAudioModeAsync,
-  useAudioPlayer,
-  useAudioPlayerStatus,
-  useAudioRecorder,
-  useAudioRecorderState,
   useAudioStream,
 } from "expo-audio";
 import { Feather, Ionicons, MaterialCommunityIcons } from "@expo/vector-icons";
@@ -42,18 +36,11 @@ import {
   useFonts,
 } from "@expo-google-fonts/dm-sans";
 
-import { cancelTranscription, createMeeting, deleteTranscript, endMeeting, generateTranscriptSummary, getAudioUrl, getHistory, joinMeeting, renameTranscriptSpeaker, retryTranscription, submitAudio, translateTranscript, updateTranscript, WS_URL } from "./api";
+import { cancelTranscription, createMeeting, deleteTranscript, endMeeting, generateTranscriptSummary, getHistory, joinMeeting, renameTranscriptSpeaker, retryTranscription, submitAudio, translateTranscript, updateTranscript, WS_URL } from "./api";
 import type { Language, MeetingConnection, ProcessingStage, Segment, SessionType, TranscriptRecord, TranscriptSummary } from "./types";
 import type { MeetingClient, MeetingParticipantView } from "./livekitMeeting";
 import { startWebAudioStream, type WebAudioStream } from "./webAudioStream";
 import { useHistoryEvents } from "./hooks/useHistoryEvents";
-
-const LANGUAGES: Array<{ value: Language; native: string }> = [
-  { value: "Sinhala", native: "සිංහල" },
-  { value: "Tamil", native: "தமிழ்" },
-  { value: "English", native: "English" },
-  { value: "Mixed", native: "Mixed" },
-];
 
 const SESSION_TYPES: Array<{
   value: SessionType;
@@ -66,22 +53,6 @@ const SESSION_TYPES: Array<{
   { value: "Upload", label: "Upload", hint: "Choose an audio file", icon: "upload-cloud" },
   { value: "Meeting", label: "Meeting", hint: "Join multiple devices", icon: "users" },
 ];
-
-const VOICE_RECORDING_OPTIONS = {
-  ...RecordingPresets.HIGH_QUALITY,
-  sampleRate: 16_000,
-  numberOfChannels: 1,
-  bitRate: 64_000,
-  android: {
-    ...RecordingPresets.HIGH_QUALITY.android,
-    audioSource: "voice_recognition" as const,
-  },
-  web: {
-    ...RecordingPresets.HIGH_QUALITY.web,
-    bitsPerSecond: 64_000,
-  },
-  isMeteringEnabled: true,
-};
 
 const waveform = [
   16, 24, 35, 22, 45, 30, 54, 38, 25, 48, 60, 34, 52,
@@ -245,62 +216,6 @@ function AnimatedWaveform({ active, intensity, styles }: { active: boolean; inte
   );
 }
 
-function AudioPlayback({ recordId, seekRequest, styles }: { recordId: string; seekRequest?: number | null; styles: AppStyles }) {
-  const player = useAudioPlayer(getAudioUrl(recordId), { updateInterval: 250 });
-  const playback = useAudioPlayerStatus(player);
-  const total = playback.duration || 0;
-  const [trackWidth, setTrackWidth] = useState(0);
-  const progress = total > 0 ? Math.max(0, Math.min(1, playback.currentTime / total)) : 0;
-
-  useEffect(() => {
-    if (seekRequest == null) return;
-    void player.seekTo(Math.max(0, seekRequest));
-    player.play();
-  }, [player, seekRequest]);
-
-  const toggle = async () => {
-    if (playback.playing) {
-      player.pause();
-      return;
-    }
-    await setAudioModeAsync({ allowsRecording: false, playsInSilentMode: true });
-    if (playback.didJustFinish || (total > 0 && playback.currentTime >= total - 0.1)) {
-      await player.seekTo(0);
-    }
-    player.play();
-  };
-
-  const seek = (event: GestureResponderEvent) => {
-    if (total <= 0 || trackWidth <= 0) return;
-    const fraction = Math.max(0, Math.min(1, event.nativeEvent.locationX / trackWidth));
-    void player.seekTo(fraction * total);
-  };
-
-  return (
-    <View style={styles.audioPlayer}>
-      <Pressable accessibilityRole="button" accessibilityLabel={playback.playing ? "Pause recording" : "Play recording"} onPress={() => void toggle()} style={styles.audioPlayButton}>
-        <Feather name={playback.playing ? "pause" : "play"} size={15} color="white" />
-      </Pressable>
-      <View
-        accessibilityRole="adjustable"
-        accessibilityLabel="Recording position"
-        onLayout={(event) => setTrackWidth(event.nativeEvent.layout.width)}
-        onStartShouldSetResponder={() => total > 0}
-        onMoveShouldSetResponder={() => total > 0}
-        onResponderGrant={seek}
-        onResponderMove={seek}
-        style={styles.audioProgressTouch}
-      >
-        <View style={styles.audioProgressTrack}>
-          <View style={[styles.audioProgressFill, { width: `${progress * 100}%` }]} />
-          <View style={[styles.audioProgressThumb, { left: `${progress * 100}%` }]} />
-        </View>
-      </View>
-      <Text style={styles.audioTime}>{formatTime(playback.currentTime)} / {formatTime(total)}</Text>
-    </View>
-  );
-}
-
 function SummaryPanel({
   record,
   summarizing,
@@ -395,13 +310,11 @@ function TranscriptPanel({
   processingStage,
   duration,
   intensity = 0,
-  audioRecordId,
   exportRecord,
   copied,
   exportBusy,
   onCopy,
   onSaveTranscript,
-  onSaveAudio,
   summarizing,
   summaryCopied,
   onGenerateSummary,
@@ -409,8 +322,6 @@ function TranscriptPanel({
   onSaveSummary,
   onUpdateRecord,
   onRenameSpeaker,
-  onTranslate,
-  translating,
   styles,
 }: {
   segments: Segment[];
@@ -419,13 +330,11 @@ function TranscriptPanel({
   processingStage?: ProcessingStage | null;
   duration: number;
   intensity?: number;
-  audioRecordId?: string | null;
   exportRecord?: TranscriptRecord | null;
   copied?: boolean;
-  exportBusy?: "transcript" | "audio" | "summary" | null;
+  exportBusy?: "transcript" | "summary" | null;
   onCopy?: (record: TranscriptRecord) => void;
   onSaveTranscript?: (record: TranscriptRecord) => void;
-  onSaveAudio?: (record: TranscriptRecord) => void;
   summarizing?: boolean;
   summaryCopied?: boolean;
   onGenerateSummary?: (record: TranscriptRecord) => void;
@@ -437,10 +346,8 @@ function TranscriptPanel({
   translating?: boolean;
   styles: AppStyles;
 }) {
-  const [seekRequest, setSeekRequest] = useState<number | null>(null);
   const [editingIndex, setEditingIndex] = useState<number | null>(null);
   const [editText, setEditText] = useState("");
-  const [translationLanguage, setTranslationLanguage] = useState<Language>("English");
   const isProcessing = !active && (status === "queued" || status === "processing" || Boolean(processingStage));
   const processingTitle = processingStage ? PROCESSING_LABELS[processingStage] : "Processing transcript";
   const processingCopy = processingStage === "diarizing"
@@ -469,61 +376,28 @@ function TranscriptPanel({
         <Text style={styles.timeText}>{active ? "REC" : "READY"}</Text>
       </View>
 
-      {audioRecordId && !active && status === "completed" ? <AudioPlayback recordId={audioRecordId} seekRequest={seekRequest} styles={styles} /> : null}
-
-      {exportRecord && ((exportRecord.status === "completed" && transcriptText(exportRecord)) || exportRecord.audio_filename) ? (
+      {exportRecord && exportRecord.status === "completed" && transcriptText(exportRecord) ? (
         <View style={styles.exportActions}>
-          {exportRecord.status === "completed" && transcriptText(exportRecord) ? (
-            <>
-              <Pressable
-                accessibilityRole="button"
-                accessibilityLabel="Copy transcript"
-                disabled={Boolean(exportBusy)}
-                onPress={() => onCopy?.(exportRecord)}
-                style={({ pressed }) => [styles.exportButton, copied && styles.exportButtonSuccess, pressed && styles.exportButtonPressed]}
-              >
-                <Feather name={copied ? "check" : "copy"} size={14} color={copied ? "#34B981" : "#B9A7FF"} />
-                <Text style={[styles.exportButtonText, copied && styles.exportButtonSuccessText]}>{copied ? "Copied" : "Quick copy"}</Text>
-              </Pressable>
-              <Pressable
-                accessibilityRole="button"
-                accessibilityLabel="Save transcript as text file"
-                disabled={Boolean(exportBusy)}
-                onPress={() => onSaveTranscript?.(exportRecord)}
-                style={({ pressed }) => [styles.exportButton, pressed && styles.exportButtonPressed, exportBusy && styles.exportButtonDisabled]}
-              >
-                {exportBusy === "transcript" ? <ActivityIndicator color="#B9A7FF" size={13} /> : <Feather name="file-text" size={14} color="#B9A7FF" />}
-                <Text style={styles.exportButtonText}>Save TXT</Text>
-              </Pressable>
-            </>
-          ) : null}
-          {exportRecord.audio_filename ? (
-            <Pressable
-              accessibilityRole="button"
-              accessibilityLabel="Save recorded audio"
-              disabled={Boolean(exportBusy)}
-              onPress={() => onSaveAudio?.(exportRecord)}
-              style={({ pressed }) => [styles.exportButton, pressed && styles.exportButtonPressed, exportBusy && styles.exportButtonDisabled]}
-            >
-              {exportBusy === "audio" ? <ActivityIndicator color="#B9A7FF" size={13} /> : <Feather name="download" size={14} color="#B9A7FF" />}
-              <Text style={styles.exportButtonText}>Save audio</Text>
-            </Pressable>
-          ) : null}
-          {exportRecord.status === "completed" && exportRecord.segments.length ? (
-            <>
-              <Pressable
-                accessibilityRole="button"
-                accessibilityLabel={`Translate transcript to ${translationLanguage}`}
-                disabled={Boolean(exportBusy) || translating}
-                onPress={() => onTranslate?.(exportRecord, translationLanguage)}
-                onLongPress={() => setTranslationLanguage((current) => current === "English" ? "Tamil" : current === "Tamil" ? "Sinhala" : "English")}
-                style={styles.exportButton}
-              >
-                {translating ? <ActivityIndicator color="#B9A7FF" size={13} /> : <Feather name="globe" size={14} color="#B9A7FF" />}
-                <Text style={styles.exportButtonText}>Translate: {translationLanguage}</Text>
-              </Pressable>
-            </>
-          ) : null}
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel="Copy transcript"
+            disabled={Boolean(exportBusy)}
+            onPress={() => onCopy?.(exportRecord)}
+            style={({ pressed }) => [styles.exportButton, copied && styles.exportButtonSuccess, pressed && styles.exportButtonPressed]}
+          >
+            <Feather name={copied ? "check" : "copy"} size={14} color={copied ? "#34B981" : "#B9A7FF"} />
+            <Text style={[styles.exportButtonText, copied && styles.exportButtonSuccessText]}>{copied ? "Copied" : "Quick copy"}</Text>
+          </Pressable>
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel="Save transcript as text file"
+            disabled={Boolean(exportBusy)}
+            onPress={() => onSaveTranscript?.(exportRecord)}
+            style={({ pressed }) => [styles.exportButton, pressed && styles.exportButtonPressed, exportBusy && styles.exportButtonDisabled]}
+          >
+            {exportBusy === "transcript" ? <ActivityIndicator color="#B9A7FF" size={13} /> : <Feather name="file-text" size={14} color="#B9A7FF" />}
+            <Text style={styles.exportButtonText}>Save TXT</Text>
+          </Pressable>
         </View>
       ) : null}
 
@@ -543,16 +417,13 @@ function TranscriptPanel({
         ) : null}
         {segments.length === 0 ? (
           <View style={styles.emptyTranscript}>
-            <View style={styles.emptyIcon}><MaterialCommunityIcons name="waveform" size={26} color="#8F8A9E" /></View>
+            <View style={styles.emptyIcon}><MaterialCommunityIcons name={isProcessing ? "text-box-outline" : active ? "microphone-outline" : "waveform"} size={26} color="#8F8A9E" /></View>
             <Text style={styles.emptyTitle}>{isProcessing ? "Transcript on the way" : active && status === "recording" ? "Recording in progress" : active ? "Listening for speech" : "Ready when you are"}</Text>
-            <Text style={styles.emptyCopy}>{isProcessing ? "Your final text will appear here automatically." : active && status === "recording" ? "Tap Stop session when you finish. This mode transcribes the saved recording after you stop." : active ? "Speak clearly and live text will appear here." : "Choose your language and session type, then start transcribing."}</Text>
+            <Text style={styles.emptyCopy}>{isProcessing ? "Your final text will appear here automatically." : active && status === "recording" ? "Keep speaking. Your words will appear here as they are recognized." : active ? "Speak naturally and your live transcript will appear here." : "Choose your language and session type, then start a session."}</Text>
           </View>
         ) : segments.map((segment, index) => (
           <Pressable
             key={`${segment.start}-${index}`}
-            accessibilityRole="button"
-            accessibilityLabel={`Play audio at ${formatTime(segment.start)}`}
-            onPress={() => audioRecordId && setSeekRequest(segment.start + index / 100000)}
             onLongPress={() => {
               if (!exportRecord || !onUpdateRecord) return;
               setEditingIndex(index);
@@ -594,8 +465,12 @@ function TranscriptPanel({
                     setEditingIndex(null);
                   }} style={styles.segmentEditSave}><Feather name="check" size={14} color="white" /></Pressable>
                 </View>
+              ) : segment.translated_text ? (
+                <>
+                  <Text style={styles.segmentText}>{segment.translated_text}</Text>
+                  <Text style={styles.sourceText}>{segment.text}</Text>
+                </>
               ) : <Text style={styles.segmentText}>{segment.text}</Text>}
-              {segment.translated_text ? <Text style={styles.translatedText}>{segment.translated_text}</Text> : null}
             </View>
           </Pressable>
         ))}
@@ -617,7 +492,7 @@ export default function App() {
   const styles = useMemo(() => createStyles(isDark, width), [isDark, width]);
   const isWide = width >= 900;
   const [tab, setTab] = useState<"new" | "history">("new");
-  const [language, setLanguage] = useState<Language>("Sinhala");
+  const [language] = useState<Language>("Mixed");
   const [sessionType, setSessionType] = useState<SessionType>("Live");
   const [diarization, setDiarization] = useState(true);
   const [active, setActive] = useState(false);
@@ -638,7 +513,7 @@ export default function App() {
   const [jobActionId, setJobActionId] = useState<string | null>(null);
   const [historySearch, setHistorySearch] = useState("");
   const [historyLanguage, setHistoryLanguage] = useState<Language | "All">("All");
-  const [exporting, setExporting] = useState<{ id: string; kind: "transcript" | "audio" | "summary" } | null>(null);
+  const [exporting, setExporting] = useState<{ id: string; kind: "transcript" | "summary" } | null>(null);
   const [trackedJobIds, setTrackedJobIds] = useState<string[]>([]);
   const [currentRecordId, setCurrentRecordId] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -653,8 +528,6 @@ export default function App() {
   const copiedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const currentRecordIdRef = useRef<string | null>(null);
   const activeRef = useRef(false);
-  const recorder = useAudioRecorder(VOICE_RECORDING_OPTIONS);
-  const recorderState = useAudioRecorderState(recorder, 250);
 
   useEffect(() => { currentRecordIdRef.current = currentRecordId; }, [currentRecordId]);
   useEffect(() => { activeRef.current = active; }, [active]);
@@ -696,12 +569,6 @@ export default function App() {
     const timer = setInterval(() => setDuration((Date.now() - started) / 1000), 250);
     return () => clearInterval(timer);
   }, [active]);
-
-  useEffect(() => {
-    if (sessionType !== "Record" || !active) return;
-    const decibels = recorderState.metering ?? -60;
-    setVoiceIntensity(Math.max(0, Math.min(1, (decibels + 60) / 50)));
-  }, [active, recorderState.metering, sessionType]);
 
   const refreshHistory = useCallback(async () => {
     try {
@@ -808,14 +675,6 @@ export default function App() {
     }
   };
 
-  const renameSpeaker = async (record: TranscriptRecord, oldName: string, newName: string) => {
-    try {
-      applyRecordUpdate(await renameTranscriptSpeaker(record.id, oldName, newName));
-    } catch (error) {
-      Alert.alert("Could not rename speaker", error instanceof Error ? error.message : "Speaker update failed");
-    }
-  };
-
   const translateRecord = async (record: TranscriptRecord, target: Language) => {
     if (target === "Mixed" || translatingRecordId) return;
     setTranslatingRecordId(record.id);
@@ -827,6 +686,15 @@ export default function App() {
       setTranslatingRecordId(null);
     }
   };
+
+  const renameSpeaker = async (record: TranscriptRecord, oldName: string, newName: string) => {
+    try {
+      applyRecordUpdate(await renameTranscriptSpeaker(record.id, oldName, newName));
+    } catch (error) {
+      Alert.alert("Could not rename speaker", error instanceof Error ? error.message : "Speaker update failed");
+    }
+  };
+
 
   const runJobAction = async (record: TranscriptRecord, action: "cancel" | "retry") => {
     if (jobActionId) return;
@@ -895,35 +763,6 @@ export default function App() {
     }
   };
 
-  const saveAudio = async (record: TranscriptRecord) => {
-    if (exporting || !record.audio_filename) return;
-    setExporting({ id: record.id, kind: "audio" });
-    try {
-      const extension = record.audio_filename.split(".").pop()?.replace(/[^a-zA-Z0-9]/g, "") || "wav";
-      const filename = exportFilename(record, extension);
-      const response = await fetch(getAudioUrl(record.id));
-      if (!response.ok) throw new Error("Recorded audio could not be downloaded");
-      if (Platform.OS === "web") {
-        downloadWebFile(await response.blob(), filename);
-      } else {
-        const available = await Sharing.isAvailableAsync();
-        if (!available) throw new Error("File sharing is not available on this device");
-        const file = new File(Paths.cache, filename);
-        file.create({ overwrite: true });
-        file.write(new Uint8Array(await response.arrayBuffer()));
-        await Sharing.shareAsync(file.uri, {
-          dialogTitle: "Save or share recorded audio",
-          mimeType: response.headers.get("content-type") ?? "audio/*",
-          UTI: "public.audio",
-        });
-      }
-    } catch (error) {
-      Alert.alert("Could not save audio", error instanceof Error ? error.message : "Download failed");
-    } finally {
-      setExporting(null);
-    }
-  };
-
   useEffect(() => { void refreshHistory(); }, [refreshHistory]);
 
   useEffect(() => {
@@ -975,7 +814,7 @@ export default function App() {
     }, LIVE_CONNECTION_TIMEOUT_MS);
     const clearConnectionTimer = () => clearTimeout(connectionTimer);
     socket.onopen = () => {
-      socket.send(JSON.stringify({ language, diarization, sample_rate: 16000, title: `Live • ${new Date().toLocaleString()}` }));
+      socket.send(JSON.stringify({ language, session_type: sessionType, diarization, sample_rate: 16000, title: `${sessionType} • ${new Date().toLocaleString()}` }));
     };
     socket.onmessage = (event) => {
       void (async () => {
@@ -993,6 +832,14 @@ export default function App() {
           } else if (message.type === "transcript") {
             setStatus("listening");
             setSegments((current) => [...current, message.segment]);
+          } else if (message.type === "translation") {
+            setSegments((current) => current.map((segment) => (
+              segment.start === message.segment.start
+                && segment.end === message.segment.end
+                && segment.text === message.segment.text
+                ? { ...segment, translated_text: message.segment.translated_text }
+                : segment
+            )));
           } else if (message.type === "warning") {
             setStatus("listening - preview delayed");
             setBusy(false);
@@ -1082,9 +929,9 @@ export default function App() {
     setProcessingStage(null);
     setSegments([]);
     setDuration(0);
-    const connection = join
+      const connection = join
       ? await joinMeeting(meetingCode, displayName, diarization)
-      : await createMeeting(displayName, language, diarization);
+      : await createMeeting(displayName, "Mixed", diarization);
     try {
       await connectToMeeting(connection);
     } catch (error) {
@@ -1109,34 +956,6 @@ export default function App() {
     meetingClientRef.current = null;
     setMeetingParticipants([]);
     setMeetingConnection(null);
-    setBusy(false);
-  };
-
-  const startRecord = async () => {
-    await prepareMic();
-    setCurrentRecordId(null);
-    setSegments([]);
-    setDuration(0);
-    setProcessingStage("recording");
-    await recorder.prepareToRecordAsync();
-    recorder.record();
-    setStatus("recording");
-    setActive(true);
-  };
-
-  const stopRecord = async () => {
-    const recordedDuration = recorderState.durationMillis / 1000;
-    await recorder.stop();
-    setActive(false);
-    const uri = recorder.uri;
-    if (!uri) throw new Error("The recording could not be saved");
-    setBusy(true);
-    setStatus("uploading");
-    const result = await submitAudio(uri, "recording.m4a", "audio/mp4", language, "Record", diarization, undefined, recordedDuration);
-    trackJob(result.id);
-    setCurrentRecordId(result.id);
-    setStatus("processing");
-    setProcessingStage("transcribing");
     setBusy(false);
   };
 
@@ -1166,10 +985,10 @@ export default function App() {
   const handlePrimary = async () => {
     try {
       if (sessionType === "Meeting") return active ? await stopMeeting() : await startMeeting(false);
-      if (active) return sessionType === "Live" ? await stopLive() : await stopRecord();
+      if (active) return sessionType === "Live" || sessionType === "Record" ? await stopLive() : await stopMeeting();
       if (sessionType === "Upload") return await chooseUpload();
-      if (sessionType === "Live") return await startLive();
-      return await startRecord();
+      if (sessionType === "Live" || sessionType === "Record") return await startLive();
+      return await startLive();
     } catch (error) {
       if (sessionType === "Live") {
         await stopAudioCapture();
@@ -1190,7 +1009,7 @@ export default function App() {
   const primaryLabel = active
     ? sessionType === "Meeting" && !meetingConnection?.is_host ? "Leave meeting" : sessionType === "Meeting" ? "End meeting" : "Stop session"
     : sessionType === "Upload" ? "Choose audio file" : sessionType === "Live" ? "Start live transcription" : sessionType === "Meeting" ? "Create meeting" : "Start recording";
-  const shownDuration = sessionType === "Record" && active ? recorderState.durationMillis / 1000 : duration;
+  const shownDuration = duration;
   const displayedSegments = selected?.segments ?? [];
   const currentExportRecord = history.find((record) => record.id === currentRecordId) ?? null;
   const filteredHistory = useMemo(() => {
@@ -1251,7 +1070,7 @@ export default function App() {
                 ) : null}
               </View>
               <Text numberOfLines={2} style={styles.historyDetailTitle}>{selected.title}</Text>
-              <TranscriptPanel segments={displayedSegments} active={false} status={selected.status} processingStage={selected.processing_stage} duration={selected.duration_seconds ?? 0} audioRecordId={selected.audio_filename ? selected.id : null} exportRecord={selected} copied={copiedRecordId === selected.id} exportBusy={exporting?.id === selected.id ? exporting.kind : null} onCopy={(record) => void copyTranscript(record)} onSaveTranscript={(record) => void saveTranscript(record)} onSaveAudio={(record) => void saveAudio(record)} summarizing={summarizingRecordId === selected.id} summaryCopied={copiedSummaryRecordId === selected.id} onGenerateSummary={(record) => void generateSummary(record)} onCopySummary={(summary) => void copySummary(selected.id, summary)} onSaveSummary={(record) => void saveSummary(record)} onUpdateRecord={(record, next) => void editTranscriptSegments(record, next)} onRenameSpeaker={(record, oldName, newName) => void renameSpeaker(record, oldName, newName)} onTranslate={(record, target) => void translateRecord(record, target)} translating={translatingRecordId === selected.id} styles={styles} />
+              <TranscriptPanel segments={displayedSegments} active={false} status={selected.status} processingStage={selected.processing_stage} duration={selected.duration_seconds ?? 0} exportRecord={selected} copied={copiedRecordId === selected.id} exportBusy={exporting?.id === selected.id ? exporting.kind : null} onCopy={(record) => void copyTranscript(record)} onSaveTranscript={(record) => void saveTranscript(record)} summarizing={summarizingRecordId === selected.id} summaryCopied={copiedSummaryRecordId === selected.id} onGenerateSummary={(record) => void generateSummary(record)} onCopySummary={(summary) => void copySummary(selected.id, summary)} onSaveSummary={(record) => void saveSummary(record)} onUpdateRecord={(record, next) => void editTranscriptSegments(record, next)} onRenameSpeaker={(record, oldName, newName) => void renameSpeaker(record, oldName, newName)} onTranslate={(record, target) => void translateRecord(record, target)} translating={translatingRecordId === selected.id} styles={styles} />
             </View>
           ) : (
             <View style={[styles.historyLayout, isWide && styles.historyLayoutWide]}>
@@ -1309,7 +1128,7 @@ export default function App() {
                 ))}
                 </ScrollView>
               </View>
-              {isWide ? <View style={[styles.historyTranscriptPane, { height: Math.max(620, height - 245) }]}><View style={styles.historyTranscriptHeading}><Text style={styles.historyTranscriptLabel}>SELECTED TRANSCRIPT</Text><Text numberOfLines={1} style={styles.historyTranscriptTitle}>{selected?.title ?? "Choose a recording"}</Text></View><TranscriptPanel segments={displayedSegments} active={false} status={selected?.status ?? "select one"} processingStage={selected?.processing_stage} duration={selected?.duration_seconds ?? 0} audioRecordId={selected?.audio_filename ? selected.id : null} exportRecord={selected} copied={copiedRecordId === selected?.id} exportBusy={exporting?.id === selected?.id ? exporting?.kind ?? null : null} onCopy={(record) => void copyTranscript(record)} onSaveTranscript={(record) => void saveTranscript(record)} onSaveAudio={(record) => void saveAudio(record)} summarizing={summarizingRecordId === selected?.id} summaryCopied={copiedSummaryRecordId === selected?.id} onGenerateSummary={(record) => void generateSummary(record)} onCopySummary={(summary) => { if (selected) void copySummary(selected.id, summary); }} onSaveSummary={(record) => void saveSummary(record)} onUpdateRecord={(record, next) => void editTranscriptSegments(record, next)} onRenameSpeaker={(record, oldName, newName) => void renameSpeaker(record, oldName, newName)} onTranslate={(record, target) => void translateRecord(record, target)} translating={translatingRecordId === selected?.id} styles={styles} /></View> : null}
+              {isWide ? <View style={[styles.historyTranscriptPane, { height: Math.max(620, height - 245) }]}><View style={styles.historyTranscriptHeading}><Text style={styles.historyTranscriptLabel}>SELECTED TRANSCRIPT</Text><Text numberOfLines={1} style={styles.historyTranscriptTitle}>{selected?.title ?? "Choose a recording"}</Text></View><TranscriptPanel segments={displayedSegments} active={false} status={selected?.status ?? "select one"} processingStage={selected?.processing_stage} duration={selected?.duration_seconds ?? 0} exportRecord={selected} copied={copiedRecordId === selected?.id} exportBusy={exporting?.id === selected?.id ? exporting?.kind ?? null : null} onCopy={(record) => void copyTranscript(record)} onSaveTranscript={(record) => void saveTranscript(record)} summarizing={summarizingRecordId === selected?.id} summaryCopied={copiedSummaryRecordId === selected?.id} onGenerateSummary={(record) => void generateSummary(record)} onCopySummary={(summary) => { if (selected) void copySummary(selected.id, summary); }} onSaveSummary={(record) => void saveSummary(record)} onUpdateRecord={(record, next) => void editTranscriptSegments(record, next)} onRenameSpeaker={(record, oldName, newName) => void renameSpeaker(record, oldName, newName)} onTranslate={(record, target) => void translateRecord(record, target)} translating={translatingRecordId === selected?.id} styles={styles} /></View> : null}
             </View>
           )}
         </ScrollView>
@@ -1323,15 +1142,14 @@ export default function App() {
           <View style={[styles.workspace, isWide && styles.workspaceWide]}>
             <View style={styles.controlsColumn}>
               <View style={styles.controlSection}>
-                <SectionTitle number="01" title="Choose your language" styles={styles} />
-                <View style={styles.languageGrid}>
-                  {LANGUAGES.map((item) => (
-                    <Pressable key={item.value} accessibilityRole="radio" accessibilityLabel={item.value} accessibilityState={{ checked: language === item.value, disabled: active || busy }} disabled={active || busy} onPress={() => setLanguage(item.value)} style={({ pressed }) => [styles.languagePill, language === item.value && styles.languagePillActive, (active || busy) && { opacity: 0.55 }, pressed && { opacity: 0.8 }]}>
-                      <Text style={[styles.languageNative, language === item.value && styles.languageNativeActive]}>{item.native}</Text>
-                      {item.value !== item.native ? <Text style={styles.languageEnglish}>{item.value}</Text> : null}
-                      {language === item.value ? <View style={styles.checkDot}><Feather name="check" size={10} color="#17131F" /></View> : null}
-                    </Pressable>
-                  ))}
+                <SectionTitle number="01" title="Automatic language detection" styles={styles} />
+                <View style={styles.autoLanguageCard}>
+                  <View style={styles.autoLanguageIcon}><Feather name="globe" size={19} color="#755BD0" /></View>
+                  <View style={styles.autoLanguageBody}>
+                    <Text style={styles.autoLanguageTitle}>Sinhala, Tamil and English</Text>
+                    <Text style={styles.autoLanguageHint}>Detected automatically. Your translation is always prepared in Tamil.</Text>
+                  </View>
+                  <View style={styles.autoLanguageBadge}><Text style={styles.autoLanguageBadgeText}>AUTO</Text></View>
                 </View>
               </View>
 
@@ -1407,7 +1225,7 @@ export default function App() {
               <View style={styles.privacyRow}><Feather name="shield" size={13} color="#716C7F" /><Text style={styles.privacyText}>Your audio is encrypted in transit and never used to train public models.</Text></View>
             </View>
 
-            <TranscriptPanel segments={segments} active={active} status={status} processingStage={processingStage} duration={shownDuration} intensity={voiceIntensity} audioRecordId={currentExportRecord?.audio_filename ? currentRecordId : null} exportRecord={currentExportRecord} copied={copiedRecordId === currentRecordId} exportBusy={exporting?.id === currentRecordId ? exporting.kind : null} onCopy={(record) => void copyTranscript(record)} onSaveTranscript={(record) => void saveTranscript(record)} onSaveAudio={(record) => void saveAudio(record)} summarizing={summarizingRecordId === currentRecordId} summaryCopied={copiedSummaryRecordId === currentRecordId} onGenerateSummary={(record) => void generateSummary(record)} onCopySummary={(summary) => { if (currentRecordId) void copySummary(currentRecordId, summary); }} onSaveSummary={(record) => void saveSummary(record)} onUpdateRecord={(record, next) => void editTranscriptSegments(record, next)} onRenameSpeaker={(record, oldName, newName) => void renameSpeaker(record, oldName, newName)} onTranslate={(record, target) => void translateRecord(record, target)} translating={translatingRecordId === currentRecordId} styles={styles} />
+            <TranscriptPanel segments={segments} active={active} status={status} processingStage={processingStage} duration={shownDuration} intensity={voiceIntensity} exportRecord={currentExportRecord} copied={copiedRecordId === currentRecordId} exportBusy={exporting?.id === currentRecordId ? exporting.kind : null} onCopy={(record) => void copyTranscript(record)} onSaveTranscript={(record) => void saveTranscript(record)} summarizing={summarizingRecordId === currentRecordId} summaryCopied={copiedSummaryRecordId === currentRecordId} onGenerateSummary={(record) => void generateSummary(record)} onCopySummary={(summary) => { if (currentRecordId) void copySummary(currentRecordId, summary); }} onSaveSummary={(record) => void saveSummary(record)} onUpdateRecord={(record, next) => void editTranscriptSegments(record, next)} onRenameSpeaker={(record, oldName, newName) => void renameSpeaker(record, oldName, newName)} onTranslate={(record, target) => void translateRecord(record, target)} translating={translatingRecordId === currentRecordId} styles={styles} />
           </View>
         </ScrollView>
       )}
@@ -1477,15 +1295,14 @@ function createStyles(isDark: boolean, width: number) {
     desktopNav: { marginLeft: "auto", flexDirection: "row", gap: 8, marginRight: 18 }, navItem: { flexDirection: "row", alignItems: "center", gap: 8, paddingHorizontal: 15, height: 40, borderRadius: 10 }, navItemActive: { backgroundColor: c.raised }, navText: { color: c.muted, fontFamily: "DMSans_500Medium", fontSize: 13 }, navTextActive: { color: c.purpleText }, headerActions: { marginLeft: "auto", flexDirection: "row", alignItems: "center", gap: 10 }, themeButton: { width: 36, height: 36, borderRadius: 11, backgroundColor: c.raised, borderWidth: 1, borderColor: c.border, alignItems: "center", justifyContent: "center" }, avatar: { width: 36, height: 36, borderRadius: 18, backgroundColor: c.purpleSurface, borderWidth: 1, borderColor: c.strongBorder, alignItems: "center", justifyContent: "center" }, avatarText: { color: c.purpleText, fontFamily: "DMSans_700Bold", fontSize: 11 },
     mainScroll: { paddingHorizontal: 22, paddingTop: 48, paddingBottom: 110 }, pageIntro: { width: "100%", maxWidth: 1180, alignSelf: "center", marginBottom: 34 }, eyebrow: { color: "#8063D1", fontFamily: "DMSans_700Bold", fontSize: 10, letterSpacing: 2.3, marginBottom: 10 }, heroTitle: { color: c.text, fontFamily: "DMSans_700Bold", fontSize: 34, letterSpacing: -1.25 }, heroCopy: { color: c.muted, fontFamily: "DMSans_400Regular", fontSize: 14, marginTop: 9 },
     workspace: { width: "100%", maxWidth: 1180, alignSelf: "center", gap: 22 }, workspaceWide: { flexDirection: "row", alignItems: "stretch" }, controlsColumn: { flex: 1.06, gap: 24 }, controlSection: { gap: 15 }, sectionTitle: { flexDirection: "row", alignItems: "center", gap: 10 }, numberBadge: { width: 27, height: 27, borderRadius: 8, backgroundColor: c.purpleSurface, alignItems: "center", justifyContent: "center" }, numberText: { color: "#8D6BE5", fontFamily: "DMSans_700Bold", fontSize: 10 }, sectionHeading: { color: c.softText, fontFamily: "DMSans_600SemiBold", fontSize: 14 },
-    languageGrid: { flexDirection: "row", flexWrap: "wrap", gap: 9 }, languagePill: { minWidth: 105, height: 58, paddingHorizontal: 16, borderRadius: 13, borderWidth: 1, borderColor: c.border, backgroundColor: c.surface, justifyContent: "center" }, languagePillActive: { borderColor: "#8B70DC", backgroundColor: c.selected }, languageNative: { color: c.body, fontFamily: "DMSans_600SemiBold", fontSize: 13 }, languageNativeActive: { color: c.purpleText }, languageEnglish: { color: c.faint, fontFamily: "DMSans_400Regular", fontSize: 9, marginTop: 2 }, checkDot: { position: "absolute", top: 7, right: 7, width: 16, height: 16, borderRadius: 8, backgroundColor: "#B9A7FF", alignItems: "center", justifyContent: "center" },
+    autoLanguageCard: { minHeight: 74, padding: 14, borderRadius: 15, borderWidth: 1, borderColor: "#8067CE", backgroundColor: c.selected, flexDirection: "row", alignItems: "center" }, autoLanguageIcon: { width: 40, height: 40, borderRadius: 12, backgroundColor: c.raised, alignItems: "center", justifyContent: "center", marginRight: 12 }, autoLanguageBody: { flex: 1 }, autoLanguageTitle: { color: c.purpleText, fontFamily: "DMSans_600SemiBold", fontSize: 13 }, autoLanguageHint: { color: c.faint, fontFamily: "DMSans_400Regular", fontSize: 10, lineHeight: 15, marginTop: 3 }, autoLanguageBadge: { paddingHorizontal: 8, height: 24, borderRadius: 12, backgroundColor: "#755BD0", alignItems: "center", justifyContent: "center" }, autoLanguageBadgeText: { color: "white", fontFamily: "DMSans_700Bold", fontSize: 8, letterSpacing: 0.8 },
     sessionGrid: { flexDirection: "row", gap: 10 }, sessionGridStack: { flexDirection: "column" }, sessionCard: { flex: 1, minHeight: 118, padding: 14, borderRadius: 15, borderWidth: 1, borderColor: c.border, backgroundColor: c.surface }, sessionCardActive: { borderColor: "#8067CE", backgroundColor: c.selected }, sessionIcon: { width: 36, height: 36, borderRadius: 10, backgroundColor: c.raised, alignItems: "center", justifyContent: "center", marginBottom: 10 }, sessionIconActive: { backgroundColor: "#755BD0" }, sessionLabel: { color: c.body, fontFamily: "DMSans_600SemiBold", fontSize: 13 }, sessionLabelActive: { color: c.purpleText }, sessionHint: { color: c.faint, fontFamily: "DMSans_400Regular", fontSize: 9.5, marginTop: 3 },
     toggleCard: { minHeight: 74, padding: 14, borderRadius: 15, borderWidth: 1, borderColor: c.border, backgroundColor: c.surface, flexDirection: "row", alignItems: "center" }, toggleIcon: { width: 40, height: 40, borderRadius: 12, backgroundColor: c.purpleSurface, alignItems: "center", justifyContent: "center", marginRight: 12 }, toggleText: { flex: 1 }, toggleTitle: { color: c.softText, fontFamily: "DMSans_600SemiBold", fontSize: 13 }, toggleHint: { color: c.faint, fontFamily: "DMSans_400Regular", fontSize: 10, marginTop: 3 },
     meetingCard: { gap: 11, padding: 14, borderRadius: 15, borderWidth: 1, borderColor: c.border, backgroundColor: c.surface }, meetingHeader: { flexDirection: "row", alignItems: "center", justifyContent: "space-between" }, roomCode: { color: c.purpleText, fontFamily: "DMSans_700Bold", fontSize: 15, letterSpacing: 1.5 }, meetingInput: { height: 44, borderRadius: 11, borderWidth: 1, borderColor: c.border, backgroundColor: c.raised, color: c.text, paddingHorizontal: 13, fontFamily: "DMSans_500Medium", fontSize: 12 }, meetingJoinRow: { flexDirection: "row", gap: 9 }, meetingCodeInput: { flex: 1, letterSpacing: 1.3 }, joinButton: { width: 86, borderRadius: 11, backgroundColor: c.purpleSurface, borderWidth: 1, borderColor: c.strongBorder, alignItems: "center", justifyContent: "center" }, joinButtonText: { color: c.purpleText, fontFamily: "DMSans_700Bold", fontSize: 11 }, participantList: { flexDirection: "row", flexWrap: "wrap", gap: 8 }, participantChip: { flexDirection: "row", alignItems: "center", gap: 6, paddingHorizontal: 9, height: 30, borderRadius: 15, backgroundColor: c.raised }, participantText: { color: c.body, fontFamily: "DMSans_500Medium", fontSize: 10 },
     primaryWrap: { borderRadius: 14, overflow: "hidden", marginTop: -4 }, primaryButton: { height: 55, flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 10 }, primaryText: { color: "white", fontFamily: "DMSans_600SemiBold", fontSize: 14 }, privacyRow: { flexDirection: "row", justifyContent: "center", alignItems: "center", gap: 6, marginTop: -13 }, privacyText: { color: c.faint, fontFamily: "DMSans_400Regular", fontSize: 8.5, textAlign: "center" },
     transcriptCard: { flex: 1, minHeight: 535, borderRadius: 20, borderWidth: 1, borderColor: c.border, backgroundColor: c.panel, overflow: "hidden" }, transcriptHeader: { height: 88, paddingHorizontal: 22, flexDirection: "row", alignItems: "center", justifyContent: "space-between", borderBottomWidth: 1, borderBottomColor: c.border }, panelEyebrow: { color: c.faint, fontFamily: "DMSans_700Bold", fontSize: 8, letterSpacing: 1.7 }, panelTitle: { color: c.softText, fontFamily: "DMSans_600SemiBold", fontSize: 15, marginTop: 5 }, liveBadge: { paddingHorizontal: 10, height: 25, borderRadius: 12.5, backgroundColor: "rgba(229,72,103,0.13)", flexDirection: "row", alignItems: "center", gap: 6 }, idleBadge: { backgroundColor: c.raised }, liveDot: { width: 6, height: 6, borderRadius: 3, backgroundColor: "#F15E78" }, idleDot: { backgroundColor: c.muted }, liveText: { color: "#E0526D", fontFamily: "DMSans_700Bold", fontSize: 8, letterSpacing: 1 }, idleText: { color: c.muted },
     waveform: { height: 78, marginHorizontal: 22, marginTop: 14, paddingHorizontal: 10, borderRadius: 16, borderWidth: 1, borderColor: c.border, backgroundColor: c.raised, flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 3 }, waveBar: { width: 3, borderRadius: 3, backgroundColor: "#9F7AEA" }, timelineRow: { flexDirection: "row", alignItems: "center", gap: 10, paddingHorizontal: 22, paddingTop: 10, paddingBottom: 14 }, timeText: { color: c.faint, fontFamily: "DMSans_500Medium", fontSize: 8 }, timeline: { flex: 1, height: 1, backgroundColor: c.border }, transcriptScroll: { flex: 1, borderTopWidth: 1, borderTopColor: c.border }, transcriptContent: { flexGrow: 1, padding: 22 }, emptyTranscript: { flex: 1, minHeight: 230, alignItems: "center", justifyContent: "center", paddingHorizontal: 32 }, emptyIcon: { width: 55, height: 55, borderRadius: 27.5, backgroundColor: c.raised, alignItems: "center", justifyContent: "center", marginBottom: 14 }, emptyTitle: { color: c.body, fontFamily: "DMSans_600SemiBold", fontSize: 13 }, emptyCopy: { color: c.faint, fontFamily: "DMSans_400Regular", fontSize: 10.5, lineHeight: 16, textAlign: "center", marginTop: 6 }, segmentRow: { flexDirection: "row", marginBottom: 19 }, segmentTime: { width: 42, color: c.faint, fontFamily: "DMSans_500Medium", fontSize: 9, paddingTop: 2 }, speakerLine: { width: 2, borderRadius: 2, marginRight: 12 }, segmentBody: { flex: 1 }, segmentMeta: { flexDirection: "row", alignItems: "center", gap: 7, marginBottom: 4 }, speakerName: { fontFamily: "DMSans_700Bold", fontSize: 9, textTransform: "uppercase", letterSpacing: 0.7 }, languageTag: { color: c.faint, backgroundColor: c.raised, borderRadius: 7, overflow: "hidden", paddingHorizontal: 6, paddingVertical: 2, fontFamily: "DMSans_600SemiBold", fontSize: 7.5, textTransform: "uppercase", letterSpacing: 0.5 }, segmentText: { color: c.body, fontFamily: "DMSans_400Regular", fontSize: 12.5, lineHeight: 19 },
-    segmentUncertain: { paddingHorizontal: 6, backgroundColor: "rgba(245,158,11,0.10)", borderWidth: 1, borderColor: "rgba(245,158,11,0.25)" }, uncertainTag: { color: "#D99115", fontFamily: "DMSans_700Bold", fontSize: 7.5 }, translatedText: { color: c.purpleText, fontFamily: "DMSans_400Regular", fontSize: 11.5, lineHeight: 18, marginTop: 5, paddingLeft: 8, borderLeftWidth: 2, borderLeftColor: "#755BD0" }, segmentEditRow: { flexDirection: "row", alignItems: "center", gap: 8 }, segmentEditInput: { flex: 1, minHeight: 42, padding: 8, borderRadius: 8, borderWidth: 1, borderColor: c.strongBorder, color: c.body, backgroundColor: c.raised, fontFamily: "DMSans_400Regular", fontSize: 12 }, segmentEditSave: { width: 34, height: 34, borderRadius: 9, alignItems: "center", justifyContent: "center", backgroundColor: "#755BD0" },
-    audioPlayer: { marginHorizontal: 22, marginBottom: 16, flexDirection: "row", alignItems: "center", gap: 10 }, audioPlayButton: { width: 34, height: 34, borderRadius: 17, backgroundColor: "#755BD0", alignItems: "center", justifyContent: "center" }, audioProgressTouch: { flex: 1, height: 30, justifyContent: "center" }, audioProgressTrack: { width: "100%", height: 5, borderRadius: 3, backgroundColor: c.raised }, audioProgressFill: { height: "100%", borderRadius: 3, backgroundColor: "#9F7AEA" }, audioProgressThumb: { position: "absolute", top: -4, width: 13, height: 13, marginLeft: -6.5, borderRadius: 7, borderWidth: 2, borderColor: c.panel, backgroundColor: "#B9A7FF" }, audioTime: { minWidth: 72, color: c.faint, fontFamily: "DMSans_500Medium", fontSize: 8, textAlign: "right" },
+    segmentUncertain: { paddingHorizontal: 6, backgroundColor: "rgba(245,158,11,0.10)", borderWidth: 1, borderColor: "rgba(245,158,11,0.25)" }, uncertainTag: { color: "#D99115", fontFamily: "DMSans_700Bold", fontSize: 7.5 }, translatedText: { color: c.purpleText, fontFamily: "DMSans_400Regular", fontSize: 11.5, lineHeight: 18, marginTop: 5, paddingLeft: 8, borderLeftWidth: 2, borderLeftColor: "#755BD0" }, sourceText: { color: c.faint, fontFamily: "DMSans_400Regular", fontSize: 10.5, lineHeight: 16, marginTop: 4, opacity: 0.75 }, segmentEditRow: { flexDirection: "row", alignItems: "center", gap: 8 }, segmentEditInput: { flex: 1, minHeight: 42, padding: 8, borderRadius: 8, borderWidth: 1, borderColor: c.strongBorder, color: c.body, backgroundColor: c.raised, fontFamily: "DMSans_400Regular", fontSize: 12 }, segmentEditSave: { width: 34, height: 34, borderRadius: 9, alignItems: "center", justifyContent: "center", backgroundColor: "#755BD0" },
     exportActions: { paddingHorizontal: 22, paddingBottom: 16, flexDirection: "row", flexWrap: "wrap", gap: 8 }, exportButton: { minHeight: 38, paddingHorizontal: 12, borderRadius: 11, borderWidth: 1, borderColor: c.strongBorder, backgroundColor: c.purpleSurface, flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 7 }, exportButtonPressed: { opacity: 0.72 }, exportButtonDisabled: { opacity: 0.58 }, exportButtonSuccess: { borderColor: "rgba(52,185,129,0.38)", backgroundColor: "rgba(52,185,129,0.10)" }, exportButtonText: { color: c.purpleText, fontFamily: "DMSans_600SemiBold", fontSize: 10.5 }, exportButtonSuccessText: { color: "#34B981" },
     summaryEmptyCard: { marginBottom: 20, padding: 14, borderRadius: 14, borderWidth: 1, borderColor: c.strongBorder, backgroundColor: c.purpleSurface, flexDirection: "row", alignItems: "center", gap: 11 }, summaryIcon: { width: 34, height: 34, borderRadius: 10, backgroundColor: c.raised, alignItems: "center", justifyContent: "center" }, summaryEmptyBody: { flex: 1 }, summaryTitle: { color: c.purpleText, fontFamily: "DMSans_700Bold", fontSize: 11.5 }, summaryHint: { color: c.muted, fontFamily: "DMSans_400Regular", fontSize: 9, lineHeight: 13, marginTop: 3 }, summaryGenerateButton: { minHeight: 36, paddingHorizontal: 11, borderRadius: 10, backgroundColor: "#755BD0", flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 6 }, summaryGenerateText: { color: "white", fontFamily: "DMSans_700Bold", fontSize: 9.5 },
     summaryCard: { marginBottom: 22, padding: 16, borderRadius: 15, borderWidth: 1, borderColor: c.strongBorder, backgroundColor: c.purpleSurface }, summaryHeader: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }, summaryHeadingRow: { flexDirection: "row", alignItems: "center", gap: 7 }, summaryMiniActions: { flexDirection: "row", gap: 6 }, summaryMiniButton: { width: 30, height: 30, borderRadius: 9, borderWidth: 1, borderColor: c.strongBorder, backgroundColor: c.raised, alignItems: "center", justifyContent: "center" }, summaryOverview: { color: c.body, fontFamily: "DMSans_400Regular", fontSize: 11.5, lineHeight: 18 }, summarySection: { marginTop: 15, gap: 7 }, summarySectionTitle: { color: c.purpleText, fontFamily: "DMSans_700Bold", fontSize: 9, letterSpacing: 0.7, textTransform: "uppercase" }, summaryPointRow: { flexDirection: "row", alignItems: "flex-start", gap: 8 }, summaryBullet: { width: 5, height: 5, borderRadius: 3, backgroundColor: "#9F7AEA", marginTop: 6 }, summaryPointText: { flex: 1, color: c.body, fontFamily: "DMSans_400Regular", fontSize: 10.5, lineHeight: 16 }, summaryActionItem: { padding: 10, borderRadius: 10, backgroundColor: c.raised, gap: 5 }, summaryActionMeta: { color: c.faint, fontFamily: "DMSans_500Medium", fontSize: 8.5, marginLeft: 20 },
@@ -1518,9 +1335,6 @@ function createStyles(isDark: boolean, width: number) {
     workspace: { ...base.workspace, gap: 28 },
     controlsColumn: { ...base.controlsColumn, minWidth: 0, gap: 24 },
     sectionHeading: { ...base.sectionHeading, flexShrink: 1, fontSize: 15 },
-    languagePill: { ...base.languagePill, flexGrow: 1, minWidth: compact ? "45%" : 105, minHeight: 68, height: "auto", paddingVertical: 13 },
-    languageNative: { ...base.languageNative, fontSize: 15 },
-    languageEnglish: { ...base.languageEnglish, fontSize: 11 },
     sessionGrid: { ...base.sessionGrid, flexWrap: "wrap", gap: 12 },
     sessionGridStack: { flexDirection: "row", flexWrap: "wrap" },
     sessionCard: { ...base.sessionCard, flexBasis: "45%", flexGrow: 1, minHeight: 128, padding: 16 },
@@ -1542,7 +1356,6 @@ function createStyles(isDark: boolean, width: number) {
     emptyTitle: { ...base.emptyTitle, fontSize: 16, textAlign: "center" },
     emptyCopy: { ...base.emptyCopy, fontSize: 13, lineHeight: 21 },
     exportButton: { ...base.exportButton, minHeight: 44 },
-    audioPlayButton: { ...base.audioPlayButton, width: 44, height: 44, borderRadius: 22 },
     summaryEmptyCard: { ...base.summaryEmptyCard, flexWrap: "wrap" },
     summaryGenerateButton: { ...base.summaryGenerateButton, minHeight: 44 },
     summaryOverview: { ...base.summaryOverview, fontSize: 14, lineHeight: 23 },

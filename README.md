@@ -27,7 +27,7 @@ An initial `backend/.env` is already included locally and is gitignored. Edit th
 
 Server host, port, reload mode, CORS origins, model IDs, GCP location, and data directory are also configured in `.env`. `GCP_PROJECT` may remain blank when `project_id` exists in the service-account JSON. `python run.py` reads `APP_HOST`, `APP_PORT`, and `APP_RELOAD` from this file.
 
-Uploaded and recorded files use `gemini-3.5-flash` through the `global`
+Uploaded and recorded files use `gemini-3.5-transcribe-preview` through the `global`
 Vertex endpoint. Live PCM uses the same quality model in overlapping WAV chunks;
 `LIVE_CHUNK_SECONDS` and `LIVE_CHUNK_OVERLAP_SECONDS` control the preview tradeoff.
 Availability still depends on the configured Vertex project having the Vertex AI
@@ -111,11 +111,11 @@ npm run build:web
 
 ## Processing behavior
 
-- Live PCM is transcribed in overlapping chunks by Gemini 3.5 Flash as a provisional preview. Overlap prevents words at chunk boundaries from being cut in half; midpoint filtering prevents duplicate preview segments.
+- Live PCM is transcribed in overlapping chunks by Gemini 3.5 Transcribe Live Preview as a provisional preview. Overlap prevents words at chunk boundaries from being cut in half; midpoint filtering prevents duplicate preview segments.
 - Meeting audio uses the same preview/final models per LiveKit participant track. Remote participants use their stable LiveKit identity; shared-device tracks optionally add pyannote speaker labels.
-- On stop, recordings within the configured inline-size limit are transcribed once more as a complete file by Gemini 3.5 Flash. This authoritative pass removes chunk-boundary errors; if it is unavailable, the preview is retained with a warning.
+- On stop, recordings within the configured inline-size limit are transcribed once more as a complete file by Gemini 3.5 Transcribe Preview. This authoritative pass removes chunk-boundary errors; if it is unavailable, the preview is retained with a warning.
 - When speaker identification is enabled, the authoritative Gemini pass returns stable anonymous speaker labels. Community-1 then refines them with its exclusive timeline; if the local model cannot safely load, the Gemini labels remain available with a warning.
-- Record/Upload uses one Gemini 3.5 Flash pass. With diarization enabled, Community-1 starts only after Gemini finishes, then both outputs are merged by maximum timestamp overlap.
+- Record/Upload uses one Gemini 3.5 Transcribe Preview pass. With diarization enabled, Community-1 starts only after Gemini finishes, then both outputs are merged by maximum timestamp overlap.
 - Sinhala, Tamil, and English modes enforce one language. Mixed mode preserves all three in native scripts and labels each utterance with its detected language.
 - Retained Record, Upload, and Live audio can be replayed from the current transcript and History views.
 
