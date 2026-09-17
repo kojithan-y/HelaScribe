@@ -36,7 +36,6 @@ ALLOWED_AUDIO_SUFFIXES = {
     ".opus",
     ".wav",
     ".webm",
-    ".wma",
 }
 
 
