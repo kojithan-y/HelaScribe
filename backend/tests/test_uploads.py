@@ -5,7 +5,7 @@ import pytest
 from fastapi import HTTPException, UploadFile
 
 from app.api.routes.transcribe import _read_limited, _wav_duration
-from app.services.audio_service import wav_rms
+from app.services.audio_service import audio_duration_seconds, wav_rms
 
 
 def test_upload_reader_accepts_content_within_limit() -> None:
@@ -36,3 +36,18 @@ def test_wav_duration_uses_actual_frames() -> None:
 
     assert _wav_duration(output.getvalue()) == 1.0
     assert wav_rms(output.getvalue()) == 0.0
+
+
+def test_audio_duration_reads_ffmpeg_supported_files(tmp_path) -> None:
+    path = tmp_path / "voice.wav"
+    output = io.BytesIO()
+    import wave
+
+    with wave.open(output, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(16_000)
+        wav.writeframes(b"\x00\x00" * 16_000)
+    path.write_bytes(output.getvalue())
+
+    assert audio_duration_seconds(path) == pytest.approx(1.0, abs=0.05)

@@ -1,4 +1,5 @@
 from functools import lru_cache
+import os
 from pathlib import Path
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -20,9 +21,9 @@ class Settings(BaseSettings):
     gcp_project: str | None = None
     # Both transcription models use the global generateContent endpoint.
     gcp_location: str = "global"
-    gemini_live_model: str = "gemini-3.5-transcribe-preview"
-    gemini_batch_model: str = "gemini-3.5-transcribe-preview"
-    gemini_text_model: str = "gemini-3.5-flash"
+    gemini_live_model: str = os.getenv("GEMINI_LIVE_MODEL", "gemini-3.5-transcribe-preview")
+    gemini_batch_model: str = os.getenv("GEMINI_BATCH_MODEL", "gemini-3.5-flash")
+    gemini_text_model: str = os.getenv("GEMINI_TEXT_MODEL", "gemini-3.5-flash")
     auto_translate: bool = True
     target_language: Language = Language.tamil
     gemini_max_retries: int = 3
@@ -45,7 +46,7 @@ class Settings(BaseSettings):
     livekit_api_secret: str | None = None
     livekit_token_minutes: int = 120
 
-    huggingface_token: str | None = None
+    huggingface_token: str | None = os.getenv("HUGGINGFACE_TOKEN", None)
     pyannote_model: str = "pyannote/speaker-diarization-community-1"
     data_dir: Path = Path("data")
     sentry_dsn: str | None = None

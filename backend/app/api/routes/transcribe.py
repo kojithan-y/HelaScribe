@@ -17,7 +17,7 @@ from app.models.schemas import (
     SessionType,
     TranscriptRecord,
 )
-from app.services.audio_service import wav_rms
+from app.services.audio_service import audio_duration_seconds, wav_rms
 from app.services.diarization_service import diarize_file, merge_transcript_and_speakers
 from app.services.gemini_service import GeminiService
 
@@ -107,8 +107,14 @@ async def _process(record: TranscriptRecord, path: Path, mime_type: str) -> None
     try:
         audio = await asyncio.to_thread(path.read_bytes)
         known_duration = record.duration_seconds
-        if known_duration is None and path.suffix.lower() == ".wav":
-            known_duration = _wav_duration(audio)
+        if known_duration is None:
+            known_duration = (
+                _wav_duration(audio)
+                if path.suffix.lower() == ".wav"
+                else await asyncio.to_thread(audio_duration_seconds, path)
+            )
+            if known_duration is not None:
+                record.duration_seconds = known_duration
         gemini = GeminiService()
         energy = wav_rms(audio) if path.suffix.lower() == ".wav" else None
         if energy is not None and energy < get_settings().live_silence_rms_threshold:

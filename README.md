@@ -27,7 +27,7 @@ An initial `backend/.env` is already included locally and is gitignored. Edit th
 
 Server host, port, reload mode, CORS origins, model IDs, GCP location, and data directory are also configured in `.env`. `GCP_PROJECT` may remain blank when `project_id` exists in the service-account JSON. `python run.py` reads `APP_HOST`, `APP_PORT`, and `APP_RELOAD` from this file.
 
-Uploaded and recorded files use `gemini-3.5-transcribe-preview` through the `global`
+Uploaded and recorded files use `gemini-3.5-flash` through the `global`
 Vertex endpoint. Live PCM uses the same quality model in overlapping WAV chunks;
 `LIVE_CHUNK_SECONDS` and `LIVE_CHUNK_OVERLAP_SECONDS` control the preview tradeoff.
 Availability still depends on the configured Vertex project having the Vertex AI
