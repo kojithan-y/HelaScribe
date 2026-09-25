@@ -8,10 +8,11 @@ import {
   Platform,
   Pressable,
   ScrollView,
+  StyleProp,
   StyleSheet,
-  Switch,
   Text,
   TextInput,
+  TextStyle,
   View,
   useColorScheme,
   useWindowDimensions,
@@ -51,7 +52,6 @@ const SESSION_TYPES: Array<{
   { value: "Record", label: "Record", hint: "Capture a session", icon: "mic" },
   { value: "Live", label: "Live", hint: "Transcribe as you speak", icon: "radio" },
   { value: "Upload", label: "Upload", hint: "Choose an audio file", icon: "upload-cloud" },
-  { value: "Meeting", label: "Meeting", hint: "Join multiple devices", icon: "users" },
 ];
 
 const waveform = [
@@ -153,6 +153,34 @@ function SectionTitle({ number, title, styles }: { number: string; title: string
       <View style={styles.numberBadge}><Text style={styles.numberText}>{number}</Text></View>
       <Text style={styles.sectionHeading}>{title}</Text>
     </View>
+  );
+}
+
+function TypewriterText({ text, style }: { text: string; style: StyleProp<TextStyle> }) {
+  const [count, setCount] = useState(0);
+  const [cursorOn, setCursorOn] = useState(true);
+
+  useEffect(() => {
+    const typeTimer = setInterval(() => {
+      setCount((current) => (current >= text.length ? current : current + 1));
+    }, 45);
+    const loopTimer = setInterval(() => setCount(0), 5000);
+    return () => {
+      clearInterval(typeTimer);
+      clearInterval(loopTimer);
+    };
+  }, [text]);
+
+  useEffect(() => {
+    const blinkTimer = setInterval(() => setCursorOn((value) => !value), 500);
+    return () => clearInterval(blinkTimer);
+  }, []);
+
+  return (
+    <Text style={style}>
+      {text.slice(0, count)}
+      <Text style={{ opacity: count < text.length || cursorOn ? 1 : 0 }}>|</Text>
+    </Text>
   );
 }
 
@@ -494,7 +522,8 @@ export default function App() {
   const [tab, setTab] = useState<"new" | "history">("new");
   const [language] = useState<Language>("Mixed");
   const [sessionType, setSessionType] = useState<SessionType>("Live");
-  const [diarization, setDiarization] = useState(true);
+  const [diarization] = useState(false);
+  const [hoveredSidebarItem, setHoveredSidebarItem] = useState<SessionType | null>(null);
   const [active, setActive] = useState(false);
   const [status, setStatus] = useState("ready");
   const [processingStage, setProcessingStage] = useState<ProcessingStage | null>(null);
@@ -793,12 +822,6 @@ export default function App() {
     setVoiceIntensity(0);
     setStatus("connecting");
     setBusy(true);
-    if (Platform.OS === "web") {
-      webAudioRef.current = await startWebAudioStream((buffer, level) => {
-        setVoiceIntensity((current) => current * 0.35 + level * 0.65);
-        onAudioBuffer({ data: buffer });
-      });
-    }
     const socket = new WebSocket(WS_URL);
     socket.binaryType = "arraybuffer";
     socketRef.current = socket;
@@ -825,7 +848,14 @@ export default function App() {
             trackJob(message.id);
             setCurrentRecordId(message.id);
             setProcessingStage("recording");
-            if (Platform.OS !== "web") await liveAudio.stream.start();
+            if (Platform.OS === "web") {
+              webAudioRef.current = await startWebAudioStream((buffer, level) => {
+                setVoiceIntensity((current) => current * 0.35 + level * 0.65);
+                onAudioBuffer({ data: buffer });
+              });
+            } else {
+              await liveAudio.stream.start();
+            }
             setStatus("listening");
             setActive(true);
             setBusy(false);
@@ -1025,7 +1055,37 @@ export default function App() {
   if (!fontsLoaded) return <View style={styles.loading}><ActivityIndicator color="#9F7AEA" /></View>;
 
   return (
-    <View style={styles.app}>
+    <View style={styles.appShell}>
+      {isWide ? (
+        <View style={styles.iconSidebar}>
+          {SESSION_TYPES.map((item) => (
+            <View key={item.value} style={styles.iconSidebarItemWrap}>
+              <Pressable
+                accessibilityRole="radio"
+                accessibilityLabel={`${item.label}. ${item.hint}`}
+                accessibilityState={{ checked: sessionType === item.value }}
+                onHoverIn={() => setHoveredSidebarItem(item.value)}
+                onHoverOut={() => setHoveredSidebarItem((current) => (current === item.value ? null : current))}
+                onPress={() => { setSessionType(item.value); setTab("new"); setSelected(null); }}
+                style={({ pressed }) => [
+                  styles.iconSidebarButton,
+                  sessionType === item.value && styles.iconSidebarButtonActive,
+                  hoveredSidebarItem === item.value && { transform: [{ scale: 1.18 }] },
+                  pressed && { opacity: 0.8 },
+                ]}
+              >
+                <Feather name={item.icon} size={19} color={sessionType === item.value ? "white" : "#9A95A8"} />
+              </Pressable>
+              {hoveredSidebarItem === item.value ? (
+                <View style={styles.iconSidebarTooltip}>
+                  <Text style={styles.iconSidebarTooltipText}>{item.label}</Text>
+                </View>
+              ) : null}
+            </View>
+          ))}
+        </View>
+      ) : null}
+      <View style={styles.app}>
       <StatusBar style={isDark ? "light" : "dark"} />
       <View style={styles.glowOne} /><View style={styles.glowTwo} />
       <View style={styles.header}>
@@ -1033,7 +1093,7 @@ export default function App() {
           <LinearGradient colors={["#A78BFA", "#6D5CE7"]} style={styles.logo}>
             <MaterialCommunityIcons name="waveform" size={23} color="white" />
           </LinearGradient>
-          <View><Text style={styles.brandName}>HelaScribe</Text><Text style={styles.brandTagline}>VOICE TO TEXT, BEAUTIFULLY</Text></View>
+          <View><Text style={styles.brandName}>VoxLive</Text><Text style={styles.brandTagline}>VOICE TO TEXT, BEAUTIFULLY</Text></View>
         </Pressable>
         {isWide ? (
           <View style={styles.desktopNav}>
@@ -1050,7 +1110,6 @@ export default function App() {
           >
             <Feather name={isDark ? "sun" : "moon"} size={17} color={isDark ? "#D8CDF8" : "#5C477A"} />
           </Pressable>
-          <View style={styles.avatar}><Text style={styles.avatarText}>KS</Text></View>
         </View>
       </View>
 
@@ -1136,7 +1195,7 @@ export default function App() {
         <ScrollView key="new" contentContainerStyle={styles.mainScroll} keyboardShouldPersistTaps="handled">
           <View style={styles.pageIntro}>
             <Text style={styles.eyebrow}>NEW TRANSCRIPTION</Text>
-            <Text style={styles.heroTitle}>Turn every voice into words.</Text>
+            <TypewriterText text="Turn every voice into words." style={styles.heroTitle} />
             <Text style={styles.heroCopy}>Fast, accurate transcription for Sinhala, Tamil and English.</Text>
           </View>
           <View style={[styles.workspace, isWide && styles.workspaceWide]}>
@@ -1164,56 +1223,6 @@ export default function App() {
                     </Pressable>
                   ))}
                 </View>
-              </View>
-
-              {sessionType === "Meeting" ? (
-                <View style={styles.meetingCard}>
-                  <View style={styles.meetingHeader}>
-                    <View><Text style={styles.toggleTitle}>Online meeting</Text><Text style={styles.toggleHint}>Create a room or join from another device</Text></View>
-                    {meetingConnection ? <Text style={styles.roomCode}>{meetingConnection.room_code}</Text> : null}
-                  </View>
-                  {!active ? (
-                    <>
-                      <TextInput
-                        value={meetingName}
-                        onChangeText={setMeetingName}
-                        editable={!busy}
-                        maxLength={80}
-                        placeholder="Your display name"
-                        placeholderTextColor="#716C7B"
-                        style={styles.meetingInput}
-                      />
-                      <View style={styles.meetingJoinRow}>
-                        <TextInput
-                          value={meetingCode}
-                          onChangeText={(value) => setMeetingCode(value.toUpperCase())}
-                          editable={!busy}
-                          autoCapitalize="characters"
-                          maxLength={8}
-                          placeholder="Room code"
-                          placeholderTextColor="#716C7B"
-                          style={[styles.meetingInput, styles.meetingCodeInput]}
-                        />
-                        <Pressable disabled={busy} onPress={() => void startMeeting(true).catch((error) => {
-                          setBusy(false);
-                          Alert.alert("Could not join", error instanceof Error ? error.message : "Meeting failed");
-                        })} style={styles.joinButton}><Text style={styles.joinButtonText}>Join</Text></Pressable>
-                      </View>
-                    </>
-                  ) : (
-                    <View style={styles.participantList}>
-                      {meetingParticipants.map((participant) => (
-                        <View key={participant.identity} style={styles.participantChip}><Feather name="user" size={12} color="#B9A7FF" /><Text style={styles.participantText}>{participant.name}</Text></View>
-                      ))}
-                    </View>
-                  )}
-                </View>
-              ) : null}
-
-              <View style={styles.toggleCard}>
-                <View style={styles.toggleIcon}><MaterialCommunityIcons name="account-voice" size={22} color="#B9A7FF" /></View>
-                <View style={styles.toggleText}><Text style={styles.toggleTitle}>{sessionType === "Meeting" ? "Multiple speakers on this device" : "Identify speakers"}</Text><Text style={styles.toggleHint}>{sessionType === "Meeting" ? "Run diarization for this participant's shared microphone" : "Separate and label each voice automatically"}</Text></View>
-                <Switch disabled={active || busy} value={diarization} onValueChange={setDiarization} trackColor={{ false: "#393543", true: "#7C62D8" }} thumbColor="#F7F4FF" />
               </View>
 
               <Pressable disabled={busy && !active} onPress={() => void handlePrimary()} style={({ pressed }) => [styles.primaryWrap, pressed && { opacity: 0.88 }, busy && !active && { opacity: 0.62 }]}>
@@ -1268,12 +1277,14 @@ export default function App() {
           <Pressable onPress={() => { setTab("history"); void refreshHistory(); }} style={styles.mobileNavItem}><Ionicons name={tab === "history" ? "time" : "time-outline"} size={24} color={tab === "history" ? "#B9A7FF" : "#777181"} /><Text style={[styles.mobileNavText, tab === "history" && styles.mobileNavTextActive]}>History</Text></Pressable>
         </View>
       ) : null}
+      </View>
     </View>
   );
 }
 
 function createStyles(isDark: boolean, width: number) {
   const compact = width < 540;
+  const hasIconSidebar = width >= 900;
   const c = isDark ? {
     bg: "#100E14", header: "rgba(16,14,20,0.92)", surface: "#1A181E", panel: "#18161C",
     raised: "#25222B", selected: "#2A2338", border: "#302C38", strongBorder: "#4B4262",
@@ -1287,14 +1298,21 @@ function createStyles(isDark: boolean, width: number) {
   };
 
   const base = StyleSheet.create({
+    appShell: { flex: 1, flexDirection: "row", backgroundColor: c.bg },
     app: { flex: 1, backgroundColor: c.bg, overflow: "hidden" }, loading: { flex: 1, backgroundColor: c.bg, alignItems: "center", justifyContent: "center" },
+    iconSidebar: { width: 68, backgroundColor: c.header, borderRightWidth: 1, borderRightColor: c.border, alignItems: "center", justifyContent: "center", gap: 14, zIndex: 6 },
+    iconSidebarItemWrap: { position: "relative", width: "100%", alignItems: "center", justifyContent: "center" },
+    iconSidebarButton: { width: 44, height: 44, borderRadius: 13, alignItems: "center", justifyContent: "center", alignSelf: "center", backgroundColor: "transparent" },
+    iconSidebarButtonActive: { backgroundColor: "#755BD0" },
+    iconSidebarTooltip: { position: "absolute", left: 54, top: 9, paddingHorizontal: 10, height: 28, borderRadius: 8, backgroundColor: c.raised, borderWidth: 1, borderColor: c.strongBorder, alignItems: "center", justifyContent: "center", zIndex: 10 },
+    iconSidebarTooltipText: { color: c.text, fontFamily: "DMSans_500Medium", fontSize: 12 },
     glowOne: { position: "absolute", width: 450, height: 450, borderRadius: 225, backgroundColor: c.glowOne, top: -260, left: -160 },
     glowTwo: { position: "absolute", width: 500, height: 500, borderRadius: 250, backgroundColor: c.glowTwo, bottom: -350, right: -200 },
-    header: { height: Platform.OS === "web" ? 82 : 96, paddingTop: Platform.OS === "web" ? 0 : 22, paddingHorizontal: 28, flexDirection: "row", alignItems: "center", borderBottomWidth: 1, borderBottomColor: c.border, backgroundColor: c.header, zIndex: 4 },
+    header: { height: Platform.OS === "web" ? 82 : 96, paddingTop: Platform.OS === "web" ? 0 : 22, paddingLeft: hasIconSidebar ? 16 : 28, paddingRight: 28, flexDirection: "row", alignItems: "center", borderBottomWidth: 1, borderBottomColor: c.border, backgroundColor: c.header, zIndex: 4 },
     brand: { flexDirection: "row", alignItems: "center", gap: 11 }, logo: { width: 42, height: 42, borderRadius: 13, alignItems: "center", justifyContent: "center" }, brandName: { color: c.text, fontFamily: "DMSans_700Bold", fontSize: 19, letterSpacing: -0.4 }, brandTagline: { color: c.faint, fontFamily: "DMSans_600SemiBold", fontSize: 7.5, letterSpacing: 1.25, marginTop: 2 },
     desktopNav: { marginLeft: "auto", flexDirection: "row", gap: 8, marginRight: 18 }, navItem: { flexDirection: "row", alignItems: "center", gap: 8, paddingHorizontal: 15, height: 40, borderRadius: 10 }, navItemActive: { backgroundColor: c.raised }, navText: { color: c.muted, fontFamily: "DMSans_500Medium", fontSize: 13 }, navTextActive: { color: c.purpleText }, headerActions: { marginLeft: "auto", flexDirection: "row", alignItems: "center", gap: 10 }, themeButton: { width: 36, height: 36, borderRadius: 11, backgroundColor: c.raised, borderWidth: 1, borderColor: c.border, alignItems: "center", justifyContent: "center" }, avatar: { width: 36, height: 36, borderRadius: 18, backgroundColor: c.purpleSurface, borderWidth: 1, borderColor: c.strongBorder, alignItems: "center", justifyContent: "center" }, avatarText: { color: c.purpleText, fontFamily: "DMSans_700Bold", fontSize: 11 },
-    mainScroll: { paddingHorizontal: 22, paddingTop: 48, paddingBottom: 110 }, pageIntro: { width: "100%", maxWidth: 1180, alignSelf: "center", marginBottom: 34 }, eyebrow: { color: "#8063D1", fontFamily: "DMSans_700Bold", fontSize: 10, letterSpacing: 2.3, marginBottom: 10 }, heroTitle: { color: c.text, fontFamily: "DMSans_700Bold", fontSize: 34, letterSpacing: -1.25 }, heroCopy: { color: c.muted, fontFamily: "DMSans_400Regular", fontSize: 14, marginTop: 9 },
-    workspace: { width: "100%", maxWidth: 1180, alignSelf: "center", gap: 22 }, workspaceWide: { flexDirection: "row", alignItems: "stretch" }, controlsColumn: { flex: 1.06, gap: 24 }, controlSection: { gap: 15 }, sectionTitle: { flexDirection: "row", alignItems: "center", gap: 10 }, numberBadge: { width: 27, height: 27, borderRadius: 8, backgroundColor: c.purpleSurface, alignItems: "center", justifyContent: "center" }, numberText: { color: "#8D6BE5", fontFamily: "DMSans_700Bold", fontSize: 10 }, sectionHeading: { color: c.softText, fontFamily: "DMSans_600SemiBold", fontSize: 14 },
+    mainScroll: { paddingLeft: hasIconSidebar ? 16 : 22, paddingRight: 22, paddingTop: 48, paddingBottom: 110 }, pageIntro: { width: "100%", maxWidth: hasIconSidebar ? 1500 : 1180, alignSelf: hasIconSidebar ? "flex-start" : "center", marginBottom: 22 }, eyebrow: { color: "#8063D1", fontFamily: "DMSans_700Bold", fontSize: 10, letterSpacing: 2.3, marginBottom: 10 }, heroTitle: { color: c.text, fontFamily: "DMSans_700Bold", fontSize: 34, letterSpacing: -1.25 }, heroCopy: { color: c.muted, fontFamily: "DMSans_400Regular", fontSize: 14, marginTop: 9 },
+    workspace: { width: "100%", maxWidth: hasIconSidebar ? 1500 : 1180, alignSelf: hasIconSidebar ? "flex-start" : "center", gap: 22 }, workspaceWide: { flexDirection: "row", alignItems: "stretch" }, controlsColumn: { flex: 0.85, gap: 24 }, controlSection: { gap: 15 }, sectionTitle: { flexDirection: "row", alignItems: "center", gap: 10 }, numberBadge: { width: 27, height: 27, borderRadius: 8, backgroundColor: c.purpleSurface, alignItems: "center", justifyContent: "center" }, numberText: { color: "#8D6BE5", fontFamily: "DMSans_700Bold", fontSize: 10 }, sectionHeading: { color: c.softText, fontFamily: "DMSans_600SemiBold", fontSize: 14 },
     autoLanguageCard: { minHeight: 74, padding: 14, borderRadius: 15, borderWidth: 1, borderColor: "#8067CE", backgroundColor: c.selected, flexDirection: "row", alignItems: "center" }, autoLanguageIcon: { width: 40, height: 40, borderRadius: 12, backgroundColor: c.raised, alignItems: "center", justifyContent: "center", marginRight: 12 }, autoLanguageBody: { flex: 1 }, autoLanguageTitle: { color: c.purpleText, fontFamily: "DMSans_600SemiBold", fontSize: 13 }, autoLanguageHint: { color: c.faint, fontFamily: "DMSans_400Regular", fontSize: 10, lineHeight: 15, marginTop: 3 }, autoLanguageBadge: { paddingHorizontal: 8, height: 24, borderRadius: 12, backgroundColor: "#755BD0", alignItems: "center", justifyContent: "center" }, autoLanguageBadgeText: { color: "white", fontFamily: "DMSans_700Bold", fontSize: 8, letterSpacing: 0.8 },
     sessionGrid: { flexDirection: "row", gap: 10 }, sessionGridStack: { flexDirection: "column" }, sessionCard: { flex: 1, minHeight: 118, padding: 14, borderRadius: 15, borderWidth: 1, borderColor: c.border, backgroundColor: c.surface }, sessionCardActive: { borderColor: "#8067CE", backgroundColor: c.selected }, sessionIcon: { width: 36, height: 36, borderRadius: 10, backgroundColor: c.raised, alignItems: "center", justifyContent: "center", marginBottom: 10 }, sessionIconActive: { backgroundColor: "#755BD0" }, sessionLabel: { color: c.body, fontFamily: "DMSans_600SemiBold", fontSize: 13 }, sessionLabelActive: { color: c.purpleText }, sessionHint: { color: c.faint, fontFamily: "DMSans_400Regular", fontSize: 9.5, marginTop: 3 },
     toggleCard: { minHeight: 74, padding: 14, borderRadius: 15, borderWidth: 1, borderColor: c.border, backgroundColor: c.surface, flexDirection: "row", alignItems: "center" }, toggleIcon: { width: 40, height: 40, borderRadius: 12, backgroundColor: c.purpleSurface, alignItems: "center", justifyContent: "center", marginRight: 12 }, toggleText: { flex: 1 }, toggleTitle: { color: c.softText, fontFamily: "DMSans_600SemiBold", fontSize: 13 }, toggleHint: { color: c.faint, fontFamily: "DMSans_400Regular", fontSize: 10, marginTop: 3 },
@@ -1325,10 +1343,10 @@ function createStyles(isDark: boolean, width: number) {
 
   return StyleSheet.create({
     ...readable,
-    header: { ...base.header, paddingHorizontal: compact ? 18 : 32 },
+    header: { ...base.header, paddingLeft: compact ? 18 : hasIconSidebar ? 16 : 32, paddingRight: compact ? 18 : 32 },
     brandTagline: { ...base.brandTagline, fontSize: 9, letterSpacing: 1 },
     themeButton: { ...base.themeButton, width: 44, height: 44, borderRadius: 14 },
-    mainScroll: { ...base.mainScroll, paddingHorizontal: compact ? 18 : 32, paddingTop: compact ? 28 : 44 },
+    mainScroll: { ...base.mainScroll, paddingLeft: compact ? 18 : hasIconSidebar ? 16 : 32, paddingRight: compact ? 18 : 32, paddingTop: compact ? 28 : hasIconSidebar ? 26 : 44 },
     pageIntro: { ...base.pageIntro, marginBottom: 30 },
     heroTitle: { ...base.heroTitle, fontSize: compact ? 30 : 40, lineHeight: compact ? 38 : 49 },
     heroCopy: { ...base.heroCopy, fontSize: 15, lineHeight: 23, maxWidth: 540 },
@@ -1337,7 +1355,7 @@ function createStyles(isDark: boolean, width: number) {
     sectionHeading: { ...base.sectionHeading, flexShrink: 1, fontSize: 15 },
     sessionGrid: { ...base.sessionGrid, flexWrap: "wrap", gap: 12 },
     sessionGridStack: { flexDirection: "row", flexWrap: "wrap" },
-    sessionCard: { ...base.sessionCard, flexBasis: "45%", flexGrow: 1, minHeight: 128, padding: 16 },
+    sessionCard: { ...base.sessionCard, flexBasis: "30%", flexGrow: 1, minHeight: 128, padding: 16 },
     sessionLabel: { ...base.sessionLabel, fontSize: 15 },
     sessionHint: { ...base.sessionHint, fontSize: 12, lineHeight: 18, marginTop: 5 },
     toggleCard: { ...base.toggleCard, padding: 16, gap: 4 },

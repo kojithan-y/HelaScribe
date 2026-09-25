@@ -37,7 +37,13 @@ LANGUAGE_GUIDANCE = {
         "detected_language to Sinhala, Tamil, English, or Unknown. Split an utterance when "
         "the spoken language changes. English speech must remain in Latin script; do not "
         "write English words using Sinhala or Tamil characters. Sinhala speech must remain "
-        "in Sinhala script, and Tamil speech must remain in Tamil script."
+        "in Sinhala script (Unicode block U+0D80-U+0DFF), and Tamil speech must remain in "
+        "Tamil script (U+0B80-U+0BFF). Sinhala and Tamil are visually similar to Kannada, "
+        "Malayalam, and Devanagari, but are distinct scripts — never substitute Sinhala "
+        "text with Kannada, Malayalam, or Devanagari characters, even if the audio is brief "
+        "or unclear. If genuinely unsure of the exact words, transcribe your best-effort "
+        "approximation using the correct script for the spoken language rather than "
+        "switching scripts."
     ),
 }
 
@@ -184,6 +190,11 @@ class GeminiService:
                 " Return only the transcript text, without markdown, JSON, timestamps, "
                 "or commentary. If there is no intelligible speech, return EMPTY."
             )
+            if translate_to:
+                prompt += (
+                    f" Translate the speech into {translate_to.value} before returning it. "
+                    "Return only the translated text, not the source transcript."
+                )
         for attempt in range(self.settings.gemini_max_retries + 1):
             try:
                 response = await asyncio.wait_for(

@@ -107,8 +107,6 @@ async def _transcribe_live_chunk(
         "audio_duration_seconds": len(chunk) / (sample_rate * 2),
         "request_timeout_seconds": settings.gemini_live_timeout_seconds,
     }
-    if getattr(settings, "auto_translate", False):
-        request["translate_to"] = settings.target_language
     return await gemini.transcribe_file(
         _pcm_wav_bytes(chunk, sample_rate),
         "audio/wav",
@@ -195,6 +193,7 @@ async def _finalize_live(record: TranscriptRecord, path: Path) -> None:
         record.status = JobStatus.completed
         record.processing_stage = None
     except Exception as exc:
+        logger.exception("Live finalize failed for record %s", record.id)
         record.status = JobStatus.failed
         record.processing_stage = None
         record.error = str(exc)
@@ -255,21 +254,11 @@ async def live_transcription(websocket: WebSocket) -> None:
                         record,
                         offset,
                     )
-                    if settings.auto_translate and segments and any(
-                        not item.translated_text for item in segments
-                    ):
-                        translations = await gemini.translate_segments(
-                            segments, settings.target_language
-                        )
-                        segments = [
-                            item.model_copy(update={"translated_text": translated})
-                            for item, translated in zip(segments, translations, strict=True)
-                        ]
                 except Exception as exc:
                     # A transient Gemini/quota failure must not terminate the
                     # microphone WebSocket. The final full-audio pass can fill
                     # any preview gap after the user stops the session.
-                    logger.warning("Live chunk transcription skipped: %s", exc)
+                    logger.exception("Live chunk transcription skipped")
                     record.error = f"Live preview delayed: {exc}"
                     await save_record(record)
                     if not warning_sent:
@@ -281,13 +270,45 @@ async def live_transcription(websocket: WebSocket) -> None:
                         )
                         warning_sent = True
                     continue
-                for segment in segments:
-                    if not _is_committed_segment(segment, commit_after):
-                        continue
+                committed = [
+                    segment
+                    for segment in segments
+                    if _is_committed_segment(segment, commit_after)
+                ]
+                for segment in committed:
                     record.segments.append(segment)
                     await websocket.send_json(
                         {"type": "transcript", "segment": segment.model_dump()}
                     )
+
+                if settings.auto_translate and committed and any(
+                    not item.translated_text for item in committed
+                ):
+                    try:
+                        translations = await gemini.translate_segments(
+                            committed, settings.target_language
+                        )
+                    except Exception as exc:
+                        logger.warning("Live translation skipped: %s", exc)
+                        continue
+                    for segment, translated in zip(committed, translations, strict=True):
+                        for index, saved in enumerate(record.segments):
+                            if (
+                                saved.start == segment.start
+                                and saved.end == segment.end
+                                and saved.text == segment.text
+                            ):
+                                translated_segment = saved.model_copy(
+                                    update={"translated_text": translated}
+                                )
+                                record.segments[index] = translated_segment
+                                await websocket.send_json(
+                                    {
+                                        "type": "translation",
+                                        "segment": translated_segment.model_dump(),
+                                    }
+                                )
+                                break
 
         workers = [
             asyncio.create_task(transcribe_chunks())
@@ -316,9 +337,7 @@ async def live_transcription(websocket: WebSocket) -> None:
                     live_chunk = bytes(pending[:chunk_bytes])
                     offset = queued_bytes / (start.sample_rate * 2)
                     commit_after = 0.0 if first_chunk else offset + settings.live_chunk_overlap_seconds
-                    # Keep every chunk so slow model responses cannot create
-                    # permanent gaps in the live timeline.
-                    await queue.put((live_chunk, offset, commit_after))
+                    _enqueue_latest_preview(queue, (live_chunk, offset, commit_after))
                     del pending[:advance_bytes]
                     queued_bytes += advance_bytes
                     first_chunk = False

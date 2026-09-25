@@ -1,6 +1,6 @@
 {
   "expo": {
-    "name": "HelaScribe",
+    "name": "VoxLive",
     "slug": "helascribe",
     "version": "1.0.0",
     "orientation": "portrait",
@@ -21,7 +21,7 @@
       [
         "expo-audio",
         {
-          "microphonePermission": "Allow HelaScribe to transcribe your voice.",
+          "microphonePermission": "Allow VoxLive to transcribe your voice.",
           "recordAudioAndroid": true
         }
       ],
